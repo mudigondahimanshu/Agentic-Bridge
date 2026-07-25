@@ -5,11 +5,11 @@
 > or from a decision a human explicitly validated; evidence paths are cited inline.
 
 - **Target:** `/Users/himanshumudigonda/Projects/nitrostack_project/agentic-bridge/fixtures/legacy-monolith`
-- **Generated:** 2026-07-25T18:05:15.447Z
+- **Generated:** 2026-07-25T18:22:01.569Z
 - **Knowledge facts:** 57
 - **Generated skills:** 1
 - **Conflicts:** 1 detected, 1 resolved by a human
-- **Source run:** `run-1-ms0oj20c` (completed)
+- **Source run:** `run-1-ms0p4mck` (completed)
 
 ## 0. Authoritative decisions (human-validated)
 
@@ -21,7 +21,7 @@ personally adjudicated.
 
 **Ruling:** Authoritative: Microsoft Teams (Microsoft Teams — Aurora Billing / Sprint 41 Daily Scrum 10:03 K. Brandt). Ops will not approve Redis in the PCI zone. That was ADR-014 in 2023 and nothing has changed. The shared cache hosts are capped at 4 gigs RSS and Redis does not fit next to what is already resident.
 
-<sub>Resolved by `verify-script` at 2026-07-25T18:05:15.417Z. Conflict was `contradiction` — alignment 0.2073, divergence 1. Sources: Jira (AUR-4471) vs Microsoft Teams.</sub>
+<sub>Resolved by `verify-script` at 2026-07-25T18:22:01.545Z. Conflict was `contradiction` — alignment 0.2073, divergence 1. Sources: Jira (AUR-4471) vs Microsoft Teams.</sub>
 
 ## 1. Architectural topography
 

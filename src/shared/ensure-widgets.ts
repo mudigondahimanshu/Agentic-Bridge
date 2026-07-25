@@ -8,16 +8,18 @@
  * message that points nowhere near the actual cause. It is the first thing that
  * happens to anyone who clones the repo and runs it without building.
  *
- * `scripts/postinstall.mjs` normally prevents this at install time. This is the
- * second line of defence for the cases that slips past: `--ignore-scripts`, a
- * deleted `out/` directory, or a clone that is run before its install finishes.
+ * `scripts/postinstall.mjs` builds the bundle at install time. This guard exists
+ * purely to turn the remaining failure cases into a message that names the fix.
  *
- * The build's own stdout is redirected to stderr (fd 2). That is not cosmetic —
- * under the stdio transport, stdout carries the JSON-RPC stream, and a stray
- * line of build output would corrupt the protocol.
+ * It deliberately does NOT build. An earlier version shelled out to `npm run
+ * build` here, which was a mistake twice over: the build easily outlasts an MCP
+ * client's connection timeout (NitroStudio gives up after 5 attempts and shows
+ * "Connection Failed", which is *less* diagnosable than the original error), and
+ * on Windows the spawn itself fails — see the CVE-2024-27980 note in
+ * postinstall.mjs. Failing in under a millisecond with an actionable sentence
+ * beats blocking startup on a subprocess.
  */
-import { execFileSync } from 'node:child_process';
-import { existsSync, readdirSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -33,42 +35,59 @@ function findProjectRoot(): string | null {
   return null;
 }
 
-/** True when at least one widget has been exported to static HTML. */
-function widgetsAreBuilt(root: string): boolean {
-  const out = join(root, 'src', 'widgets', 'out');
-  if (!existsSync(out)) return false;
-  return readdirSync(out, { withFileTypes: true }).some(
-    (entry) => entry.isDirectory() && existsSync(join(out, entry.name, 'index.html'))
-  );
+/**
+ * Which widgets are missing from the static export.
+ *
+ * Next's export writes EITHER `out/<route>.html` or `out/<route>/index.html`
+ * depending on its trailingSlash setting, and NitroStack probes both. An earlier
+ * version of this check only looked for the directory form — the build here emits
+ * the flat form, so it reported "not built" every single time and the guard
+ * rebuilt the bundle on every server start.
+ *
+ * Checking each route from the manifest (rather than "is anything there?") also
+ * catches the stale-build case: pull a branch that adds a widget, and the export
+ * is present but incomplete.
+ */
+function missingWidgets(root: string): string[] {
+  const widgetsDir = join(root, 'src', 'widgets');
+  const out = join(widgetsDir, 'out');
+  if (!existsSync(out)) return ['<the entire export>'];
+
+  const exported = (route: string) =>
+    existsSync(join(out, `${route}.html`)) || existsSync(join(out, route, 'index.html'));
+
+  let routes: string[] = [];
+  try {
+    const manifest = JSON.parse(readFileSync(join(widgetsDir, 'widget-manifest.json'), 'utf8'));
+    routes = (manifest.widgets ?? []).map((w: { uri: string }) => String(w.uri).replace(/^\//, ''));
+  } catch {
+    // No readable manifest: fall back to "did anything at all get exported?".
+    const any = readdirSync(out, { withFileTypes: true }).some(
+      (e) => (e.isFile() && e.name.endsWith('.html')) || (e.isDirectory() && existsSync(join(out, e.name, 'index.html')))
+    );
+    return any ? [] : ['<the entire export>'];
+  }
+
+  return routes.filter((r) => r && !exported(r));
 }
 
 /**
- * Build the widget bundle if it is missing. Throws a message that names the fix
- * if the build itself fails — better than letting the factory throw a stack
- * trace about one arbitrary route.
+ * Fail fast, and in plain language, when the widget bundle is missing.
+ * Returns immediately (a couple of stat calls) in the normal case.
  */
 export function ensureWidgetsBuilt(): void {
   const root = findProjectRoot();
-  if (!root || widgetsAreBuilt(root)) return;
+  if (!root) return;
 
-  console.error('[bridge] Widget bundle missing — building it now (first run only)…');
+  const missing = missingWidgets(root);
+  if (missing.length === 0) return;
 
-  const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
-  try {
-    if (!existsSync(join(root, 'src', 'widgets', 'node_modules'))) {
-      execFileSync(npm, ['install', '--no-audit', '--no-fund'], {
-        cwd: join(root, 'src', 'widgets'),
-        stdio: ['ignore', 2, 2], // never let build output reach stdout
-      });
-    }
-    execFileSync(npm, ['run', 'build'], { cwd: root, stdio: ['ignore', 2, 2] });
-    console.error('[bridge] Widget bundle ready.');
-  } catch (error) {
-    throw new Error(
-      `The widget bundle is missing and could not be built automatically.\n` +
-        `  Reason: ${error instanceof Error ? error.message : String(error)}\n\n` +
-        `  The server cannot start without it. Run this once, then start again:\n\n` +
-        `      npm run setup\n`
-    );
-  }
+  throw new Error(
+    `The widget bundle is incomplete, so the MCP server cannot start.\n\n` +
+      `  Not exported: ${missing.join(', ')}\n\n` +
+      '  Run this once in the project folder, then start again:\n\n' +
+      '      npm run setup\n\n' +
+      '  (`npm install` normally does this for you. If it did not, scroll up in the\n' +
+      '   install output for a line starting with [bridge:postinstall].)'
+  );
 }
