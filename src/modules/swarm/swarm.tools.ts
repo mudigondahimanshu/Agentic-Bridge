@@ -66,14 +66,42 @@ export class SwarmTools {
       detect_conflicts: z.boolean().default(true).describe('Cross-reference Jira against the Teams transcript'),
     }),
     taskSupport: 'optional',
+    // Kept deliberately complete. Studio renders `examples.response` in the widget
+    // preview BEFORE the tool has ever been executed, so a sparse example is not a
+    // documentation nicety — it is what a first-time viewer sees. Omitting `agents`
+    // and `target` here rendered the console as "7/0 agents · target undefined".
     examples: {
       request: { synthesize: true },
       response: {
         runId: 'run-1',
         status: 'awaiting-resolution',
+        target: 'fixtures/legacy-monolith',
         agentsCompleted: 7,
-        factsGathered: 41,
+        agentsFailed: 0,
+        factsGathered: 54,
+        generatedSkills: 0,
         openConflicts: 1,
+        manifestSkippedReason:
+          '1 unresolved conflict(s). The run is paused rather than guessing which source is authoritative.',
+        factsByCategory: {
+          dependency: 13,
+          consensus: 11,
+          testing: 9,
+          architecture: 8,
+          'design-system': 5,
+          cicd: 4,
+          agile: 4,
+        },
+        agents: [
+          { agent: 'structural-cartographer', status: 'done', factCount: 8, durationMs: 142, summary: '33 files, 11 layers, 5 hotspots' },
+          { agent: 'documentation-synthesizer', status: 'done', factCount: 13, durationMs: 38, summary: '21 deps across 3 manifest(s), 8 aging signal(s)' },
+          { agent: 'qa-analyst', status: 'done', factCount: 9, durationMs: 51, summary: '4 runner(s), 5 written policy(ies)' },
+          { agent: 'devops-navigator', status: 'done', factCount: 4, durationMs: 44, summary: '2 pipeline(s), commit convention recovered' },
+          { agent: 'product-synchronizer', status: 'done', factCount: 4, durationMs: 6, summary: 'sprint "Sprint 41 - Invoice Read Path", 3 open issue(s)' },
+          { agent: 'scrum-analyst', status: 'done', factCount: 11, durationMs: 9, summary: '14 binding directive(s) extracted' },
+          { agent: 'uiux-integrator', status: 'done', factCount: 5, durationMs: 63, summary: '23 token(s), 3 component(s), 0 ad-hoc colour(s)' },
+        ],
+        nextStep: 'Resolve the conflict(s), then the manifest will generate.',
       },
     },
   })

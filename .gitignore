@@ -63,3 +63,4 @@ src/skills/*.skill.ts
 # NOTE: CLAUDE.md is deliberately NOT ignored. It is the artifact this project
 # exists to produce, and reviewers should be able to read it in the repo. Its
 # header states which codebase it describes (the bundled fixture, not this one).
+.nitrostudio/

@@ -13,9 +13,14 @@ import 'dotenv/config';
 import { McpApplicationFactory, DIContainer } from '@nitrostack/core';
 import { AppModule } from './app.module.js';
 import { setServer } from './shared/services/server-registry.js';
+import { ensureWidgetsBuilt } from './shared/ensure-widgets.js';
 import { SkillRuntimeService } from './modules/skills/skill-runtime.service.js';
 
 async function bootstrap() {
+  // Must run before create(): the factory resolves every @Widget route to a
+  // static export while building the tool list, and throws if one is missing.
+  ensureWidgetsBuilt();
+
   const server = await McpApplicationFactory.create(AppModule);
 
   // Must happen before start(): a client can call tools the moment we are up.

@@ -45,10 +45,17 @@ run_swarm ──► 7 personas ──► knowledge base ──► conflict? ─�
 ## Quick start
 
 ```bash
-npm install && npm --prefix src/widgets install
-npm run build
+npm install     # also installs widget deps and builds them — see note below
 npm run verify
 ```
+
+> **One command is enough.** A `postinstall` step installs the widget dependencies and
+> produces the static export. That export is derived, so it is correctly absent from git —
+> but NitroStack resolves every `@Widget` route to `src/widgets/out/<name>/index.html` while
+> building the tool list, so a clone that has never been built dies at startup with
+> `Exported HTML for route 'architecture-map' not found` and the client reports only that the
+> server shut down. The server also rebuilds the bundle itself if it ever goes missing.
+> If either safety net is bypassed (`npm install --ignore-scripts`), run `npm run setup`.
 
 `npm run verify` spawns the real MCP server over STDIO and drives the entire demo path with
 live JSON-RPC — 65 assertions covering every claim in this README. If it prints

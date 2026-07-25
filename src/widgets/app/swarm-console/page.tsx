@@ -79,7 +79,7 @@ export default function SwarmConsole() {
     <Shell
       icon="⬡"
       title="Swarm Console"
-      subtitle={`${data.runId}  ·  target ${data.target}`}
+      subtitle={[data.runId, data.target ? `target ${data.target}` : null].filter(Boolean).join('  ·  ')}
       error={error}
       onDismissError={clearError}
       actions={
@@ -96,9 +96,15 @@ export default function SwarmConsole() {
     >
       <Stats
         items={[
-          { label: 'Agents', value: `${data.agentsCompleted}/${total}`, tone: data.agentsFailed ? 'warn' : 'ok' },
-          { label: 'Facts', value: data.factsGathered, tone: 'accent' },
-          { label: 'Skills', value: data.generatedSkills },
+          {
+            // `total` is 0 when a caller hands us a summary without the per-agent
+            // array; showing "7/0" would read as a failure, so drop the denominator.
+            label: 'Agents',
+            value: total ? `${data.agentsCompleted}/${total}` : `${data.agentsCompleted ?? 0}`,
+            tone: data.agentsFailed ? 'warn' : 'ok',
+          },
+          { label: 'Facts', value: data.factsGathered ?? 0, tone: 'accent' },
+          { label: 'Skills', value: data.generatedSkills ?? 0 },
           {
             label: 'Conflicts',
             value: data.openConflicts,

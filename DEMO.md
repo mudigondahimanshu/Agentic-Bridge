@@ -7,7 +7,7 @@ every claim in it.
 
 ```bash
 cd agentic-bridge
-npm run build                      # widgets must be bundled before the server boots
+npm install                        # installs + builds widgets automatically
 npx tsx scripts/verify.ts          # 65/65 — also resets state to a clean slate
 ```
 

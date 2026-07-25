@@ -12,18 +12,20 @@
     "upgrade": "nitrostack-cli upgrade",
     "install:all": "nitrostack-cli install",
     "widget": "npm --prefix src/widgets",
+    "setup": "npm --prefix src/widgets install --no-audit --no-fund && npm run build",
+    "postinstall": "node scripts/postinstall.mjs",
     "typecheck": "tsc --noEmit",
     "verify": "tsx scripts/verify.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/ext-apps": ">=0.1.0",
-    "@nitrostack/core": "^1",
+    "@nitrostack/core": "^1.0.14",
     "dotenv": "^16.3.1",
     "typescript": "^5.3.3",
     "zod": "^3.22.4"
   },
   "devDependencies": {
-    "@nitrostack/cli": "^1",
+    "@nitrostack/cli": "^1.0.15",
     "@types/node": "^22.10.0",
     "tsx": "^4.23.1",
     "typescript": "^5.3.3"
