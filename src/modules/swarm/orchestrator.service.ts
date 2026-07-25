@@ -309,15 +309,16 @@ export class OrchestratorService {
 
     try {
       const depth = Math.min(Math.max(Number(input.max_depth ?? 3) || 3, 1), 6);
-      const surface = this.codebase.changeSurface(target, file, depth);
-      if (!surface.matched.length) {
+      const map = this.codebase.buildMap(target);
+      const surface = this.codebase.changeSurface(map, file, depth);
+      if (!surface.seeds.length) {
         return `No file in the repository matched "${file}".`;
       }
       const impacted = surface.impacted.length
         ? surface.impacted.map((entry) => `  - ${entry.path} (depth ${entry.depth}, ${entry.layer})`).join('\n')
         : '  (nothing imports it)';
       return (
-        `Matched: ${surface.matched.join(', ')}\n` +
+        `Matched: ${surface.seeds.join(', ')}\n` +
         `${surface.impacted.length} file(s) would need review:\n${impacted}`
       );
     } catch (error) {

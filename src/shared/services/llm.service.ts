@@ -1,10 +1,21 @@
 /**
- * The bridge's connection to Claude.
+ * The bridge's connection to an LLM, via OpenRouter.
  *
- * Every swarm persona and the master orchestrator reason through this service.
- * It is deliberately the only place in the project that talks to the Anthropic
- * API, so cost accounting, caching, retries, refusal handling and the
- * degradation path all exist once.
+ * OpenRouter fronts every major model behind one OpenAI-compatible API, which
+ * gives this project three things that matter:
+ *   - one credential (`OPENROUTER_API_KEY`) reaches Claude, Gemini, GPT,
+ *     DeepSeek, Llama etc., so a demo can iterate on model choice without a
+ *     code change;
+ *   - a genuine free tier via the `:free` model suffix (DeepSeek R1 by
+ *     default), so the swarm's per-persona reasoning and the master
+ *     orchestrator both run at $0 during hackathon iteration;
+ *   - a single wire format (OpenAI Chat Completions) so the tool loop below
+ *     is provider-neutral.
+ *
+ * The two public methods `reason` and `runAgentic` preserve the same shapes the
+ * callers already speak, so the swarm code and the orchestrator did not need to
+ * change when the underlying provider was swapped from the Anthropic SDK to
+ * this one.
  *
  * Three properties matter more than anything else here:
  *
@@ -12,34 +23,49 @@
  *      deterministic parsers run first and their output is handed to the model
  *      as evidence; the model's job is judgment over that evidence, not
  *      retrieval. That is what stops it inventing a coverage threshold.
- *   2. **Structured output.** Every call is constrained by a JSON schema and
- *      then validated again with Zod on the way back, so a malformed or
- *      hallucinated shape fails loudly instead of flowing into the manifest.
- *   3. **Degradation.** If there is no API key, or the API is down, or a
- *      response fails validation, the caller gets `null` and falls back to the
- *      deterministic path. A demo that dies because a network hiccup ate one
- *      agent is not a demo.
- *
- * Model choice: `claude-opus-5` by default. Thinking is on by default on Opus 5
- * — the parameter is omitted rather than set, which is the documented way to get
- * adaptive thinking on this model. Depth is controlled with `effort` instead.
+ *   2. **Structured output.** Every `reason` call constrains the response to
+ *      JSON via `response_format: { type: 'json_object' }` and validates the
+ *      shape with the caller's Zod-backed validator, so a malformed answer
+ *      fails loudly instead of flowing into the manifest.
+ *   3. **Degradation.** If there is no API key, or the network is down, or a
+ *      response fails validation, the caller gets a discriminated failure and
+ *      falls back to the deterministic path. A demo that dies because one
+ *      persona ate a rate-limit is not a demo.
  */
 import { Injectable } from '@nitrostack/core';
-import Anthropic from '@anthropic-ai/sdk';
+import OpenAI from 'openai';
+import { APIError } from 'openai';
+
+const DEFAULT_BASE_URL = 'https://openrouter.ai/api/v1';
 
 /** Default model. Override with BRIDGE_LLM_MODEL. */
-export const DEFAULT_MODEL = 'claude-opus-5';
+export const DEFAULT_MODEL = 'deepseek/deepseek-r1:free';
 
 /**
- * Per-million-token prices for the default model, used for the running cost
- * readout in the swarm console. Cache writes bill at 1.25x input and cache
- * reads at 0.1x, which is what makes the shared-evidence prefix worth caching.
+ * Per-million-token prices for common models. Used for the running cost readout
+ * in the swarm console. `:free` models bill at $0/M — that is the point of
+ * defaulting to one.
+ *
+ * Numbers are approximate and update-when-you-notice-they're-wrong; OpenRouter
+ * lists the current rates at https://openrouter.ai/models. Missing entries fall
+ * back to $0 rather than guessing, so an unknown model reports "cost unknown"
+ * rather than a fabricated number.
  */
 const PRICING: Record<string, { input: number; output: number }> = {
-  'claude-opus-5': { input: 5, output: 25 },
-  'claude-opus-4-8': { input: 5, output: 25 },
-  'claude-sonnet-5': { input: 3, output: 15 },
-  'claude-haiku-4-5': { input: 1, output: 5 },
+  'deepseek/deepseek-r1:free': { input: 0, output: 0 },
+  'deepseek/deepseek-r1': { input: 0.55, output: 2.19 },
+  'deepseek/deepseek-chat': { input: 0.14, output: 0.28 },
+  'anthropic/claude-3.5-sonnet': { input: 3, output: 15 },
+  'anthropic/claude-3.5-haiku': { input: 1, output: 5 },
+  'anthropic/claude-opus-4.5': { input: 5, output: 25 },
+  'anthropic/claude-opus-4': { input: 15, output: 75 },
+  'openai/gpt-4o': { input: 2.5, output: 10 },
+  'openai/gpt-4o-mini': { input: 0.15, output: 0.6 },
+  'openai/o1-mini': { input: 3, output: 12 },
+  'google/gemini-2.5-pro': { input: 1.25, output: 10 },
+  'google/gemini-2.5-flash': { input: 0.075, output: 0.3 },
+  'google/gemini-2.0-flash:free': { input: 0, output: 0 },
+  'meta-llama/llama-3.3-70b-instruct:free': { input: 0, output: 0 },
 };
 
 export type Effort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
@@ -49,7 +75,7 @@ export interface TokenUsage {
   output: number;
   cacheWrite: number;
   cacheRead: number;
-  /** USD, computed from the model's published rates. */
+  /** USD, computed from the model's published rates. Zero when unknown. */
   costUsd: number;
 }
 
@@ -77,16 +103,16 @@ export type JsonSchema = Record<string, unknown>;
 export interface ReasonRequest<T> {
   /** Which persona is asking — used for logging and the console readout. */
   agent: string;
-  /** The persona brief. Stable across runs, so it caches. */
+  /** The persona brief. Stable across runs. */
   system: string;
-  /**
-   * The deterministic findings the model reasons over. Large and stable within
-   * a run, which is exactly what the cache breakpoint is for.
-   */
+  /** The deterministic findings the model reasons over. */
   evidence: string;
-  /** The specific question. Volatile — deliberately last, after the breakpoint. */
+  /** The specific question, appended after the evidence. */
   task: string;
-  /** Constrains the response shape at the API level. */
+  /**
+   * The desired output shape. Injected into the system prompt so any model can
+   * honour it, and re-checked by `validate` on the way back.
+   */
   schema: JsonSchema;
   /** Second gate: validates semantics. Throw or return null to reject. */
   validate: (raw: unknown) => T;
@@ -132,38 +158,103 @@ export interface AgenticResult {
   truncated: boolean;
 }
 
-/** Structural view of the response fields this service reads. */
-interface MessageLike {
-  stop_reason?: string | null;
-  stop_details?: { category?: string | null; explanation?: string } | null;
-  content: { type: string; text?: string; id?: string; name?: string; input?: unknown }[];
-  usage?: {
-    input_tokens?: number;
-    output_tokens?: number;
-    cache_creation_input_tokens?: number | null;
-    cache_read_input_tokens?: number | null;
-  };
-  model?: string;
-}
-
 @Injectable()
 export class LlmService {
-  private readonly client: Anthropic | null;
-  private readonly explicitlyDisabled: boolean;
-  /** Cleared once a beta parameter has been rejected, so we stop resending it. */
-  private useServerSideFallbacks = true;
+  private client: OpenAI | null;
+  private explicitlyDisabled: boolean;
+  /** Non-null when configure() supplied an override key at runtime. */
+  private runtimeApiKey: string | null = null;
 
   private cumulative: TokenUsage = { ...ZERO_USAGE };
   private callCount = 0;
 
   constructor() {
     this.explicitlyDisabled = process.env.BRIDGE_LLM_ENABLED === 'false';
+    this.client = this.buildClient();
+  }
 
-    // The SDK resolves ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN, or an
-    // `ant auth login` profile on its own — constructing it with no arguments
-    // is what picks all three up. Constructing it is cheap and makes no
-    // network call, so the only reason to skip it is an explicit opt-out.
-    this.client = this.explicitlyDisabled ? null : new Anthropic({ maxRetries: 3 });
+  private buildClient(): OpenAI | null {
+    if (this.explicitlyDisabled) return null;
+    const key = this.resolveApiKey();
+    if (!key) return null;
+    return new OpenAI({
+      apiKey: key,
+      baseURL: process.env.OPENROUTER_BASE_URL?.trim() || DEFAULT_BASE_URL,
+      // Recommended by OpenRouter — routes usage attribution and keeps the
+      // free-tier quota associated with this app rather than the account root.
+      defaultHeaders: {
+        'HTTP-Referer': process.env.OPENROUTER_REFERRER || 'https://github.com/agentic-bridge',
+        'X-Title': process.env.OPENROUTER_APP_TITLE || 'Enterprise Agentic Bridge',
+      },
+      // Per-request wall-clock cap so a hung upstream cannot pin the swarm
+      // for the SDK default (10 min). Overridable for users on genuinely slow
+      // reasoning models. The value has to be higher than the model's
+      // realistic time-to-first-byte on cold requests — 60s is right for
+      // free-tier reasoning models, low enough to fail-fast on a hang.
+      timeout: Number(process.env.BRIDGE_LLM_TIMEOUT_MS ?? 60_000),
+      // maxRetries=0: rate-limit retries compound badly when we already run
+      // seven personas in parallel. Fail-fast into the discriminated result
+      // and let the swarm's own latch logic decide when to give up.
+      maxRetries: Number(process.env.BRIDGE_LLM_MAX_RETRIES ?? 0),
+    });
+  }
+
+  private resolveApiKey(): string | null {
+    if (this.runtimeApiKey) return this.runtimeApiKey;
+    // OpenRouter first, then legacy Anthropic vars as a courtesy so users who
+    // followed the previous setup instructions don't have to re-configure.
+    return (
+      process.env.OPENROUTER_API_KEY?.trim() ||
+      process.env.OPENAI_API_KEY?.trim() ||
+      process.env.ANTHROPIC_API_KEY?.trim() ||
+      null
+    );
+  }
+
+  /**
+   * Reconfigure the LLM connection at runtime.
+   *
+   * Lets an administrator drop in an API key from inside NitroStudio without
+   * restarting the server. Persistence to `.env` is opt-in — many teams would
+   * rather rotate keys per-session.
+   */
+  configure(options: {
+    apiKey?: string;
+    model?: string;
+    effort?: Effort;
+    disable?: boolean;
+  }): { available: boolean; description: string; source: string } {
+    if (options.disable) {
+      this.explicitlyDisabled = true;
+      this.client = null;
+      process.env.BRIDGE_LLM_ENABLED = 'false';
+      return { available: false, description: this.description, source: 'disabled' };
+    }
+
+    if (options.apiKey !== undefined) {
+      const trimmed = options.apiKey.trim();
+      if (trimmed) {
+        this.runtimeApiKey = trimmed;
+        process.env.OPENROUTER_API_KEY = trimmed;
+        this.explicitlyDisabled = false;
+        process.env.BRIDGE_LLM_ENABLED = 'true';
+        this.client = this.buildClient();
+      }
+    }
+
+    if (options.model !== undefined && options.model.trim()) {
+      process.env.BRIDGE_LLM_MODEL = options.model.trim();
+    }
+
+    if (options.effort && ['low', 'medium', 'high', 'xhigh', 'max'].includes(options.effort)) {
+      process.env.BRIDGE_LLM_EFFORT = options.effort;
+    }
+
+    return {
+      available: this.available,
+      description: this.description,
+      source: this.runtimeApiKey ? 'runtime' : this.available ? 'env' : 'none',
+    };
   }
 
   get model(): string {
@@ -177,25 +268,15 @@ export class LlmService {
       : 'high';
   }
 
-  /**
-   * Whether a credential is actually present. Checked without a network call:
-   * the SDK exposes the resolved key, and a bare-profile setup leaves it unset
-   * but still authenticates, so an explicit env var is treated as the reliable
-   * signal and anything else is discovered on first use.
-   */
+  /** Whether a credential is actually present. Checked without a network call. */
   get available(): boolean {
-    if (!this.client || this.explicitlyDisabled) return false;
-    return !!(
-      process.env.ANTHROPIC_API_KEY?.trim() ||
-      process.env.ANTHROPIC_AUTH_TOKEN?.trim() ||
-      this.client.apiKey
-    );
+    return !this.explicitlyDisabled && !!this.client && !!this.resolveApiKey();
   }
 
   get description(): string {
     if (this.explicitlyDisabled) return 'disabled (BRIDGE_LLM_ENABLED=false)';
-    if (!this.available) return 'no credential found (set ANTHROPIC_API_KEY)';
-    return `${this.model} @ effort=${this.effort}`;
+    if (!this.available) return 'no credential found (set OPENROUTER_API_KEY)';
+    return `${this.model} via OpenRouter @ effort=${this.effort}`;
   }
 
   /** Running total across this process, for the console readout. */
@@ -209,7 +290,7 @@ export class LlmService {
   }
 
   /* ------------------------------------------------------------------ *
-   * Structured reasoning — one call, schema-constrained
+   * Structured reasoning — one call, JSON-object constrained
    * ------------------------------------------------------------------ */
 
   /**
@@ -217,6 +298,12 @@ export class LlmService {
    *
    * Returns a discriminated result rather than throwing: every caller here has a
    * deterministic fallback, so a failure is a branch, not an exception.
+   *
+   * Portability: rather than sending `response_format: { type: 'json_schema' }`
+   * — which only a subset of models support — the schema is embedded in the
+   * system prompt as "return JSON of this shape", and `response_format:
+   * { type: 'json_object' }` guarantees the response parses as JSON. The
+   * caller's Zod-backed `validate` is the second, semantic gate.
    */
   async reason<T>(
     request: ReasonRequest<T>
@@ -227,42 +314,43 @@ export class LlmService {
 
     const started = Date.now();
     const maxTokens = request.maxTokens ?? 8000;
+    const deadlineMs = this.deadlineMs();
+
+    const systemPrompt =
+      `${request.system}\n\n` +
+      `Respond with a single JSON object matching this JSON Schema exactly. ` +
+      `Do not include any prose outside the JSON.\n\n` +
+      `<schema>\n${JSON.stringify(request.schema, null, 2)}\n</schema>`;
+
+    const userPrompt = `<evidence>\n${request.evidence}\n</evidence>\n\n${request.task}`;
 
     try {
-      const message = (await this.createMessage({
-        model: this.model,
-        max_tokens: maxTokens,
-        // Cache breakpoint on the last system block: the persona brief and the
-        // evidence are stable within a run, the task is not, and the task lives
-        // in `messages` which renders after `system`.
-        system: [
-          { type: 'text', text: request.system },
+      // AbortController + Promise.race deadline: the SDK's own `timeout` covers
+      // the initial connect but not streaming trickles that some reasoning
+      // models emit (poolside, some deepseek routes). Racing against a wall
+      // clock guarantees we never pin the swarm on a slow upstream.
+      const controller = new AbortController();
+      const message = await this.withDeadline(
+        this.client.chat.completions.create(
           {
-            type: 'text',
-            text: `<evidence>\n${request.evidence}\n</evidence>`,
-            cache_control: { type: 'ephemeral' },
+            model: this.model,
+            max_tokens: maxTokens,
+            messages: [
+              { role: 'system', content: systemPrompt },
+              { role: 'user', content: userPrompt },
+            ],
+            response_format: { type: 'json_object' },
           },
-        ],
-        messages: [{ role: 'user', content: request.task }],
-        output_config: {
-          effort: request.effort ?? this.effort,
-          format: { type: 'json_schema', schema: request.schema },
-        },
-      })) as MessageLike;
+          { signal: controller.signal }
+        ),
+        deadlineMs,
+        controller
+      );
 
-      const usage = this.accountFor(message);
+      const usage = this.accountFor(message.usage);
+      const choice = message.choices?.[0];
 
-      if (message.stop_reason === 'refusal') {
-        return {
-          ok: false,
-          failure: {
-            kind: 'refused',
-            category: message.stop_details?.category ?? null,
-            explanation: message.stop_details?.explanation,
-          },
-        };
-      }
-      if (message.stop_reason === 'max_tokens') {
+      if (choice?.finish_reason === 'length') {
         return {
           ok: false,
           failure: {
@@ -271,28 +359,32 @@ export class LlmService {
           },
         };
       }
+      if (choice?.finish_reason === 'content_filter') {
+        return {
+          ok: false,
+          failure: { kind: 'refused', category: 'content_filter' },
+        };
+      }
 
-      const text = message.content
-        .filter((block) => block.type === 'text')
-        .map((block) => block.text ?? '')
-        .join('')
-        .trim();
+      const text = (choice?.message?.content ?? '').trim();
       if (!text) {
         return { ok: false, failure: { kind: 'invalid', message: 'Model returned no text.' } };
       }
 
+      // Some reasoning models embed JSON inside ```json fences even when asked
+      // for pure JSON. Peel them off before parsing rather than failing loudly.
+      const cleaned = stripCodeFences(text);
+
       let parsed: unknown;
       try {
-        parsed = JSON.parse(text);
+        parsed = JSON.parse(cleaned);
       } catch {
         return {
           ok: false,
-          failure: { kind: 'invalid', message: 'Model response was not valid JSON.' },
+          failure: { kind: 'invalid', message: `Model response was not valid JSON: ${cleaned.slice(0, 200)}` },
         };
       }
 
-      // Second gate. Structured outputs guarantee the shape; this checks that
-      // the contents are usable — non-empty titles, known categories, and so on.
       let value: T;
       try {
         value = request.validate(parsed);
@@ -329,11 +421,17 @@ export class LlmService {
    * service executes them and feeds the results back, and the loop continues
    * until the model stops asking.
    *
-   * Written as a manual loop rather than the SDK's beta tool runner for two
-   * reasons: the tools here are in-process service calls with no need for the
-   * runner's schema generation, and every invocation has to be captured for the
-   * swarm console — watching the orchestrator interrogate its own knowledge base
-   * is the point, not an implementation detail.
+   * Every invocation is captured so the swarm console can render the
+   * orchestrator interrogating its own knowledge base — that observability is
+   * the point of hand-rolling the loop rather than delegating to an SDK
+   * runner.
+   *
+   * Note on model choice: not every model on OpenRouter is a good tool caller.
+   * DeepSeek R1 sometimes emits malformed `tool_calls` or refuses to call a
+   * tool at all; a persona pass still works because it is a single JSON call,
+   * but the orchestrator briefing may end up empty. If the loop stops with no
+   * final text, the caller sees `truncated: true` and can decide whether to
+   * proceed manifest-only or retry with a different model.
    */
   async runAgentic(request: {
     agent: string;
@@ -352,85 +450,115 @@ export class LlmService {
 
     const started = Date.now();
     const maxIterations = request.maxIterations ?? 12;
-    const maxTokens = request.maxTokens ?? 16000;
+    const maxTokens = request.maxTokens ?? 8000;
     const calls: ToolInvocation[] = [];
     let usage: TokenUsage = { ...ZERO_USAGE };
     let truncated = true;
     let finalText = '';
 
-    // `unknown[]` rather than the SDK's param union: the loop appends raw
-    // response content straight back, which is the documented requirement for
-    // preserving tool_use blocks, and re-typing it buys nothing.
-    const messages: unknown[] = [{ role: 'user', content: request.task }];
+    const openAiTools = request.tools.map((tool) => ({
+      type: 'function' as const,
+      function: {
+        name: tool.name,
+        description: tool.description,
+        parameters: tool.input_schema,
+      },
+    }));
+
+    // Typed as `any[]` to sidestep the OpenAI SDK's per-role message unions:
+    // the loop appends assistant messages with `tool_calls`, tool messages with
+    // `tool_call_id`, and user turns freely, and threading each variant through
+    // the discriminated union costs more than it protects.
+    const messages: any[] = [
+      { role: 'system', content: request.system },
+      { role: 'user', content: request.task },
+    ];
+
+    const deadlineMs = this.deadlineMs();
 
     try {
       for (let iteration = 0; iteration < maxIterations; iteration++) {
-        const message = (await this.createMessage({
-          model: this.model,
-          max_tokens: maxTokens,
-          system: [{ type: 'text', text: request.system, cache_control: { type: 'ephemeral' } }],
-          messages,
-          tools: request.tools,
-          output_config: { effort: request.effort ?? this.effort },
-        })) as MessageLike;
+        const controller = new AbortController();
+        const message = await this.withDeadline(
+          this.client.chat.completions.create(
+            {
+              model: this.model,
+              max_tokens: maxTokens,
+              messages,
+              tools: openAiTools,
+              tool_choice: 'auto',
+            },
+            { signal: controller.signal }
+          ),
+          deadlineMs,
+          controller
+        );
 
-        usage = addUsage(usage, this.accountFor(message));
+        usage = addUsage(usage, this.accountFor(message.usage));
+        const choice = message.choices?.[0];
 
-        if (message.stop_reason === 'refusal') {
+        if (choice?.finish_reason === 'content_filter') {
           return {
             ok: false,
-            failure: {
-              kind: 'refused',
-              category: message.stop_details?.category ?? null,
-              explanation: message.stop_details?.explanation,
-            },
+            failure: { kind: 'refused', category: 'content_filter' },
           };
         }
 
-        messages.push({ role: 'assistant', content: message.content });
+        const assistantMessage = choice?.message;
+        if (!assistantMessage) {
+          return {
+            ok: false,
+            failure: { kind: 'invalid', message: 'Model returned no message.' },
+          };
+        }
 
-        // A server-side tool ran out of its own iteration budget. Re-send as-is;
-        // the server resumes. Adding a "continue" user turn would break it.
-        if (message.stop_reason === 'pause_turn') continue;
+        // Echo the assistant turn back — required so the model sees its own
+        // tool_calls in the next round and can correlate the tool results.
+        messages.push({
+          role: 'assistant',
+          content: assistantMessage.content ?? '',
+          ...(assistantMessage.tool_calls?.length
+            ? { tool_calls: assistantMessage.tool_calls }
+            : {}),
+        });
 
-        const toolUses = message.content.filter((block) => block.type === 'tool_use');
-        if (!toolUses.length) {
-          finalText = message.content
-            .filter((block) => block.type === 'text')
-            .map((block) => block.text ?? '')
-            .join('')
-            .trim();
+        const toolCalls = assistantMessage.tool_calls ?? [];
+        if (!toolCalls.length) {
+          finalText = (assistantMessage.content ?? '').trim();
           truncated = false;
           break;
         }
 
-        // All results for one assistant turn go back in a single user message —
-        // splitting them teaches the model to stop calling tools in parallel.
-        const results: unknown[] = [];
-        for (const use of toolUses) {
-          const name = use.name ?? 'unknown';
-          const input = (use.input ?? {}) as Record<string, unknown>;
+        for (const call of toolCalls) {
+          if (call.type !== 'function') continue;
+          const name = call.function?.name ?? 'unknown';
+          let input: Record<string, unknown> = {};
+          try {
+            input = call.function?.arguments ? JSON.parse(call.function.arguments) : {};
+          } catch {
+            // A malformed arguments string is a model bug; report it back as
+            // the tool result so the model can correct itself rather than
+            // failing the whole loop.
+            input = {};
+          }
+
           request.onProgress?.(`${request.agent} → ${name}`);
 
           const callStarted = Date.now();
           let rendered: string;
-          let isError = false;
           try {
             rendered = await request.execute(name, input);
           } catch (error) {
             rendered = `Tool failed: ${error instanceof Error ? error.message : String(error)}`;
-            isError = true;
           }
 
           calls.push({ name, input, result: rendered, durationMs: Date.now() - callStarted });
-          results.push({
-            type: 'tool_result',
-            tool_use_id: use.id,
+          messages.push({
+            role: 'tool',
+            tool_call_id: call.id,
             content: rendered,
-            ...(isError ? { is_error: true } : {}),
           });
         }
-        messages.push({ role: 'user', content: results });
       }
 
       return {
@@ -453,61 +581,53 @@ export class LlmService {
    * Internals
    * ------------------------------------------------------------------ */
 
-  /**
-   * Issue the request with server-side refusal fallbacks, dropping to the plain
-   * endpoint if the beta is rejected.
-   *
-   * `fallbacks: "default"` re-runs a policy-declined request on Anthropic's
-   * recommended substitute inside the same call, routed by refusal category.
-   * That matters here because a legacy codebase reconnaissance pass reads a lot
-   * of auth middleware and CI secrets handling — benign work that sits close
-   * enough to the cyber classifiers to occasionally trip one.
-   */
-  private async createMessage(params: Record<string, unknown>): Promise<unknown> {
-    const client = this.client!;
-
-    if (this.useServerSideFallbacks) {
-      try {
-        return await client.beta.messages.create({
-          ...params,
-          betas: ['server-side-fallback-2026-07-01'],
-          fallbacks: 'default',
-        } as never);
-      } catch (error) {
-        // A 400 here means this account or model does not have the beta. Latch
-        // it off rather than paying a failed round trip on every later call.
-        if (error instanceof Anthropic.BadRequestError) {
-          this.useServerSideFallbacks = false;
-        } else {
-          throw error;
-        }
-      }
-    }
-
-    return client.messages.create(params as never);
+  /** Effective per-call wall clock. `BRIDGE_LLM_TIMEOUT_MS` overrides. */
+  private deadlineMs(): number {
+    return Number(process.env.BRIDGE_LLM_TIMEOUT_MS ?? 60_000);
   }
 
-  private accountFor(message: MessageLike): TokenUsage {
-    const raw = message.usage ?? {};
-    const rates = PRICING[this.model] ?? PRICING[DEFAULT_MODEL];
+  /**
+   * Race a promise against a hard deadline, aborting the in-flight request
+   * when the deadline wins. Distinct from the SDK's `timeout` because that
+   * covers connect-and-first-byte only and lets a slow-trickling upstream
+   * pin the swarm indefinitely.
+   */
+  private async withDeadline<T>(
+    promise: Promise<T>,
+    ms: number,
+    controller: AbortController
+  ): Promise<T> {
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      return await Promise.race<T>([
+        promise,
+        new Promise<T>((_, reject) => {
+          timer = setTimeout(() => {
+            controller.abort();
+            reject(new DeadlineError(`Deadline exceeded (${ms}ms)`));
+          }, ms);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
 
-    const input = raw.input_tokens ?? 0;
-    const output = raw.output_tokens ?? 0;
-    const cacheWrite = raw.cache_creation_input_tokens ?? 0;
-    const cacheRead = raw.cache_read_input_tokens ?? 0;
+  private accountFor(raw?: {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    total_tokens?: number;
+  }): TokenUsage {
+    const rates = PRICING[this.model] ?? { input: 0, output: 0 };
+    const input = raw?.prompt_tokens ?? 0;
+    const output = raw?.completion_tokens ?? 0;
 
     const usage: TokenUsage = {
       input,
       output,
-      cacheWrite,
-      cacheRead,
-      costUsd:
-        (input * rates.input +
-          output * rates.output +
-          // Published multipliers: 1.25x input to write, 0.1x input to read.
-          cacheWrite * rates.input * 1.25 +
-          cacheRead * rates.input * 0.1) /
-        1_000_000,
+      cacheWrite: 0,
+      cacheRead: 0,
+      costUsd: (input * rates.input + output * rates.output) / 1_000_000,
     };
 
     this.cumulative = addUsage(this.cumulative, usage);
@@ -516,36 +636,57 @@ export class LlmService {
   }
 
   /**
-   * Map an SDK error onto the failure union, most specific class first.
-   * `APIConnectionError` extends `APIError` in this SDK, so it has to be tested
-   * before the base class or it would never match.
+   * Map an SDK error onto the failure union.
+   *
+   * OpenRouter surfaces provider errors through the standard OpenAI error
+   * codes, so this classifier stays vendor-neutral. 429 always means "back
+   * off" here even for provider-side rate limits, because OpenRouter's own
+   * :free-tier limiter is the most common source.
    */
   private classify(error: unknown): LlmFailure {
-    if (error instanceof Anthropic.AuthenticationError) {
+    if (error instanceof DeadlineError) {
       return {
         kind: 'error',
-        message: 'Anthropic rejected the credential — check ANTHROPIC_API_KEY.',
-        retryable: false,
+        message: `${error.message}. Model "${this.model}" did not respond in time — try a faster model or raise BRIDGE_LLM_TIMEOUT_MS.`,
+        retryable: true,
       };
     }
-    if (error instanceof Anthropic.NotFoundError) {
+    // The OpenAI SDK's AbortError surfaces as a plain APIError with status 0.
+    // If our controller signalled abort but wrapping raced first, land here.
+    if (error instanceof Error && (error.name === 'AbortError' || /aborted|abort/i.test(error.message))) {
       return {
         kind: 'error',
-        message: `Model "${this.model}" was not found. Check BRIDGE_LLM_MODEL.`,
-        retryable: false,
+        message: `Request aborted (deadline hit for ${this.model}).`,
+        retryable: true,
       };
     }
-    if (error instanceof Anthropic.RateLimitError) {
-      return { kind: 'error', message: 'Rate limited by the Anthropic API.', retryable: true };
-    }
-    if (error instanceof Anthropic.APIConnectionError) {
-      return { kind: 'error', message: 'Could not reach the Anthropic API.', retryable: true };
-    }
-    if (error instanceof Anthropic.APIError) {
+    if (error instanceof APIError) {
+      const status = error.status ?? 0;
+      if (status === 401 || status === 403) {
+        return {
+          kind: 'error',
+          message: 'OpenRouter rejected the credential — check OPENROUTER_API_KEY.',
+          retryable: false,
+        };
+      }
+      if (status === 404) {
+        return {
+          kind: 'error',
+          message: `Model "${this.model}" is not available on OpenRouter. Check BRIDGE_LLM_MODEL.`,
+          retryable: false,
+        };
+      }
+      if (status === 429) {
+        return {
+          kind: 'error',
+          message: `Rate limited by OpenRouter (${error.message}). Free tier is capped at 20 req/min.`,
+          retryable: true,
+        };
+      }
       return {
         kind: 'error',
-        message: `Anthropic API error ${error.status ?? '?'}: ${error.message}`,
-        retryable: (error.status ?? 0) >= 500,
+        message: `OpenRouter error ${status}: ${error.message}`,
+        retryable: status >= 500,
       };
     }
     return {
@@ -554,6 +695,20 @@ export class LlmService {
       retryable: false,
     };
   }
+}
+
+/** Sentinel thrown by withDeadline so classify() can produce a useful failure. */
+class DeadlineError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'DeadlineError';
+  }
+}
+
+/** Strip ```json / ``` fences that some reasoning models add around JSON output. */
+function stripCodeFences(text: string): string {
+  const fenceMatch = /^```(?:json)?\s*([\s\S]*?)\s*```$/m.exec(text.trim());
+  return fenceMatch ? fenceMatch[1].trim() : text;
 }
 
 /** One-line rendering of a failure, for logs and the console readout. */

@@ -4,12 +4,12 @@
 > `synthesize_claude_md` instead. Every claim below was extracted from this repository
 > or from a decision a human explicitly validated; evidence paths are cited inline.
 
-- **Target:** `/home/ks/Desktop/Projects/Agentic-Bridge/fixtures/legacy-monolith`
-- **Generated:** 2026-07-25T19:56:57.573Z
-- **Knowledge facts:** 57
-- **Generated skills:** 1
+- **Target:** `/Users/himanshumudigonda/Projects/nitrostack_project/agentic-bridge/fixtures/legacy-monolith`
+- **Generated:** 2026-07-25T22:53:17.943Z
+- **Knowledge facts:** 55
+- **Generated skills:** 0
 - **Conflicts:** 1 detected, 1 resolved by a human
-- **Source run:** `run-1-ms0sipes` (completed)
+- **Source run:** `run-2-ms0ytgb9` (running)
 
 ## 0. Authoritative decisions (human-validated)
 
@@ -21,7 +21,7 @@ personally adjudicated.
 
 **Ruling:** Authoritative: Microsoft Teams (Microsoft Teams — Aurora Billing / Sprint 41 Daily Scrum 10:03 K. Brandt). Ops will not approve Redis in the PCI zone. That was ADR-014 in 2023 and nothing has changed. The shared cache hosts are capped at 4 gigs RSS and Redis does not fit next to what is already resident.
 
-<sub>Resolved by `verify-script` at 2026-07-25T19:56:57.531Z. Conflict was `contradiction` — alignment 0.2073, divergence 1. Sources: Jira (AUR-4471) vs Microsoft Teams.</sub>
+<sub>Resolved by `admin` at 2026-07-25T22:52:08.734Z. Conflict was `contradiction` — alignment 0.2073, divergence 1. Sources: Jira (AUR-4471) vs Microsoft Teams.</sub>
 
 ## 1. Architectural topography
 
@@ -93,17 +93,8 @@ before you touch one.
 
 ## 2. Available tailored skills
 
-The swarm generated these MCP tools specifically for this codebase. Prefer them over
-reading source files by hand — they encode how this project actually works.
-
-### `query_aurora_orm_usage`
-
-Finds every AuroraORM call site and reports which tables the codebase touches.
-
-_No parameters._
-
-**Why it exists:** AuroraORM is a hand-rolled 2009 mapper with no modern equivalent.
-<sub>Source: `src/skills/query_aurora_orm_usage.skill.ts`</sub>
+_None yet._ When you find a legacy interface that deserves a programmatic tool,
+call `generate_custom_skill` — it mints a real MCP tool and registers it live.
 
 ## 3. Current human alignment
 
@@ -246,13 +237,6 @@ Compose from these before writing new markup:
 ```
 
 > Aurora Design Language v3 - approved by Brand Council 2019-04. Do not add ad-hoc colours.  _(web/src/styles/tokens.css)_
-
-## 6. Manually injected context
-
-1 document(s) uploaded by an administrator, because the automated
-swarm could not reach them.
-
-- **ADR-021 — event bus deferred (chunk-1)** — Status: Accepted. The team evaluated an internal event bus for invoice state changes. It is deferred to Q1. Do not introduce a message broker into the billing monolith this quarter.
 
 ---
 

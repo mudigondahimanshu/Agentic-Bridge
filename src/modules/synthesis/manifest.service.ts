@@ -63,6 +63,21 @@ export class ManifestService {
       ''
     );
 
+    /* ---------------- executive briefing (master orchestrator) ---------------- */
+    const briefing = byId('llm:orchestrator:briefing');
+    if (briefing) {
+      push(
+        '## Executive briefing',
+        '',
+        '_Authored by the master orchestrator over the swarm\'s knowledge base. Everything below',
+        'is either extracted evidence or a human ruling; this section is the one place in the',
+        'document that is genuinely reasoned._',
+        '',
+        briefing.detail.trim(),
+        ''
+      );
+    }
+
     /* ------------------- 0. authoritative human decisions ------------------- */
     const resolved = conflicts.filter((c) => c.status === 'resolved' && c.resolution);
     if (resolved.length) {
@@ -262,6 +277,34 @@ export class ManifestService {
       for (const c of conventions) push(`> ${c.detail}`, '');
     } else {
       push('_No design system detected in this target._', '');
+    }
+
+    /* ------------------- reasoned insights (per persona) ------------------- */
+    const reasoned = facts
+      .filter((f) => f.reasoned && f.id.startsWith('llm:') && !f.id.startsWith('llm:orchestrator'))
+      .sort((a, b) => b.weight - a.weight);
+    if (reasoned.length) {
+      push(
+        '## Reasoned insights (per persona)',
+        '',
+        '_Judgement layered on top of the extracted evidence by each specialist agent. Distinct',
+        'from parser output — evaluate accordingly._',
+        ''
+      );
+      const byAgent = new Map<string, KnowledgeFact[]>();
+      for (const f of reasoned) {
+        const list = byAgent.get(f.agent) ?? [];
+        list.push(f);
+        byAgent.set(f.agent, list);
+      }
+      for (const [agent, list] of byAgent) {
+        push(`### ${agent}`, '');
+        for (const f of list) {
+          const evidence = f.evidence.length ? ` <sub>(${f.evidence.map((e) => `\`${e}\``).join(', ')})</sub>` : '';
+          push(`- **${f.title}** — ${this.oneLine(f.detail)}${evidence}`);
+        }
+        push('');
+      }
     }
 
     /* ------------------------- manual context ------------------------- */

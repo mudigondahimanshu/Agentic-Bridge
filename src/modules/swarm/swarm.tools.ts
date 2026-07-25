@@ -23,17 +23,43 @@ import { ConflictService } from '../conflict/conflict.service.js';
 import { ManifestService } from '../synthesis/manifest.service.js';
 import { WorkspaceService } from '../../shared/services/workspace.service.js';
 import { StoreService } from '../../shared/services/store.service.js';
+import { LlmService, describeFailure, ZERO_USAGE, addUsage } from '../../shared/services/llm.service.js';
+import type { TokenUsage } from '../../shared/services/llm.service.js';
+import { OrchestratorService } from './orchestrator.service.js';
+import { PERSONA_BRIEFS, ANALYSIS_SCHEMA, validateAnalysis, analysisToFacts } from './personas.js';
 import { SWARM_AGENTS, RunRefSchema, TargetSchema } from '../../shared/schemas/index.js';
 import type { KnowledgeFact, SwarmRun } from '../../shared/schemas/index.js';
+
+/**
+ * Build stamp echoed in every `run_swarm` response. If Studio is showing
+ * `{"error":"Tool execution failed"}`, this stamp is the fastest way to prove
+ * whether the tsx worker is running current source or a stale process.
+ */
+const SWARM_TOOL_BUILD = '2026-07-26T04:05-swarm-budget+studio-timeout-fit';
 
 interface AgentDefinition {
   agent: (typeof SWARM_AGENTS)[number];
   title: string;
   /** Returns the facts this persona contributes, plus a one-line summary. */
-  run: (target: string) => { facts: KnowledgeFact[]; summary: string };
+  run: (target: string) => { facts: KnowledgeFact[]; summary: string; evidence: unknown };
 }
 
-@Injectable({ deps: [CodebaseService, DocumentationService, QaService, DevOpsService, UiUxService, AgileService, ConflictService, ManifestService, WorkspaceService, StoreService] })
+@Injectable({
+  deps: [
+    CodebaseService,
+    DocumentationService,
+    QaService,
+    DevOpsService,
+    UiUxService,
+    AgileService,
+    ConflictService,
+    ManifestService,
+    WorkspaceService,
+    StoreService,
+    LlmService,
+    OrchestratorService,
+  ],
+})
 export class SwarmTools {
   constructor(
     private codebase: CodebaseService,
@@ -45,7 +71,9 @@ export class SwarmTools {
     private conflicts: ConflictService,
     private manifest: ManifestService,
     private workspace: WorkspaceService,
-    private store: StoreService
+    private store: StoreService,
+    private llm: LlmService,
+    private orchestrator: OrchestratorService
   ) {}
 
   @Tool({
@@ -112,57 +140,278 @@ export class SwarmTools {
     input: { target?: string; synthesize?: boolean; detect_conflicts?: boolean },
     ctx: ExecutionContext
   ) {
-    const target = this.workspace.resolveTarget(input.target);
-    const definitions = this.definitions();
+    // Full-fat try/catch — everything past the tool boundary must return a
+    // structured payload, including path-validation, DI resolution, and
+    // store writes. Anything that leaks up becomes the framework's generic
+    // `{"error":"Tool execution failed"}`, which is what a first-time viewer
+    // sees when the swarm silently fails on a bad target path.
+    let run: SwarmRun | undefined;
+    const llmAvailable = this.llm.available;
 
-    const run: SwarmRun = {
-      id: `run-${this.store.all('runs').length + 1}-${Date.now().toString(36)}`,
-      target: this.workspace.rel(this.workspace.projectRoot, target) || target,
-      startedAt: new Date().toISOString(),
-      status: 'running',
-      agents: definitions.map((d) => ({
-        agent: d.agent,
-        status: 'pending' as const,
-        factCount: 0,
-        durationMs: 0,
-        summary: '',
-      })),
-      conflictIds: [],
-    };
-    this.store.upsert('runs', run);
+    try {
+      const target = this.workspace.resolveTarget(input.target);
+      const definitions = this.definitions();
 
-    ctx.logger.info('Swarm dispatched', { runId: run.id, target, agents: definitions.length });
-
-    for (const [index, definition] of definitions.entries()) {
-      ctx.task?.throwIfCancelled();
-      ctx.task?.updateProgress(`[${index + 1}/${definitions.length}] ${definition.title}`);
-
-      const slot = run.agents[index];
-      slot.status = 'running';
+      run = {
+        id: `run-${this.store.all('runs').length + 1}-${Date.now().toString(36)}`,
+        target: this.workspace.rel(this.workspace.projectRoot, target) || target,
+        startedAt: new Date().toISOString(),
+        status: 'running',
+        agents: definitions.map((d) => ({
+          agent: d.agent,
+          status: 'pending' as const,
+          factCount: 0,
+          durationMs: 0,
+          summary: '',
+        })),
+        conflictIds: [],
+      };
       this.store.upsert('runs', run);
 
+      ctx.logger.info('Swarm dispatched', {
+        runId: run.id,
+        target,
+        agents: definitions.length,
+        llm: llmAvailable ? this.llm.description : 'disabled',
+      });
+
+      return await this.executeSwarm(input, ctx, target, definitions, llmAvailable, run);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      ctx.logger.error('Swarm run aborted', {
+        runId: run?.id ?? 'pre-run',
+        error: detail,
+        stack: error instanceof Error ? error.stack : undefined,
+      });
+      if (run) {
+        run.status = 'failed';
+        run.error = detail;
+        run.finishedAt = new Date().toISOString();
+        try {
+          this.store.upsert('runs', run);
+        } catch {
+          /* store write may itself fail — the payload is still authoritative */
+        }
+      }
+      return {
+        runId: run?.id ?? null,
+        status: 'failed',
+        target: run?.target ?? input.target ?? null,
+        error: detail,
+        agents: run?.agents ?? [],
+        agentsCompleted: run?.agents.filter((a) => a.status === 'done').length ?? 0,
+        agentsFailed: run?.agents.filter((a) => a.status === 'failed').length ?? 0,
+        factsGathered: this.safeCount('knowledge'),
+        llm: { enabled: llmAvailable, description: this.llm.description },
+        nextStep: this.diagnoseNextStep(detail),
+        buildStamp: SWARM_TOOL_BUILD,
+      };
+    }
+  }
+
+  /** Counting the knowledge base must not itself throw during error reporting. */
+  private safeCount(collection: 'knowledge'): number {
+    try {
+      return this.store.all(collection).length;
+    } catch {
+      return 0;
+    }
+  }
+
+  /** Turn a raw error message into an actionable hint for the widget. */
+  private diagnoseNextStep(detail: string): string {
+    const lower = detail.toLowerCase();
+    if (lower.includes('outside') && lower.includes('allow')) {
+      return (
+        'The target path is outside the workspace allow-list. Either omit `target` to use the bundled ' +
+        'fixture, or add your project to BRIDGE_ALLOWED_ROOTS (see .env.example) and restart.'
+      );
+    }
+    if (lower.includes('rate limit') || lower.includes('429')) {
+      return 'Rate limited by the LLM provider. Wait a minute or call configure_llm to switch models.';
+    }
+    if (lower.includes('deadline') || lower.includes('timeout')) {
+      return 'LLM did not respond in time. Call configure_llm with a faster model or raise BRIDGE_LLM_TIMEOUT_MS.';
+    }
+    return 'Inspect the error, then re-run. Call configure_llm to change model or key.';
+  }
+
+  private async executeSwarm(
+    input: { target?: string; synthesize?: boolean; detect_conflicts?: boolean },
+    ctx: ExecutionContext,
+    target: string,
+    definitions: AgentDefinition[],
+    llmAvailable: boolean,
+    run: SwarmRun
+  ) {
+    let swarmUsage: TokenUsage = { ...ZERO_USAGE };
+    const llmNotes: { agent: string; reasonedFacts: number; failure?: string }[] = [];
+    // Rate-limit latch: once we've seen N consecutive 429s from the provider,
+    // stop trying LLM for the rest of this run. Free tiers on OpenRouter
+    // sometimes throttle a single model to a handful of requests per minute,
+    // and burning 7 more rejections just delays the manifest.
+    let consecutiveRateLimits = 0;
+    let llmLatchedOff = false;
+    const RATE_LIMIT_LATCH = 2;
+
+    // Total wall-clock budget for the LLM portions of this run. Studio's
+    // synchronous tool-call timeout is ~15s; anything above this and the
+    // client gives up before the tool returns, showing its own
+    // "Tool execution failed" message. Use the async-task button (or MCP
+    // tasks in general) to escape this cap. Overridable for CLI callers.
+    const totalBudgetMs = Number(process.env.BRIDGE_SWARM_BUDGET_MS ?? 12_000);
+    const swarmDeadline = Date.now() + totalBudgetMs;
+    const budgetRemaining = () => Math.max(0, swarmDeadline - Date.now());
+    ctx.logger.info('LLM budget', { totalBudgetMs, model: this.llm.model });
+
+    /* ------------------------- deterministic pass ------------------------- */
+    // Parallel: parsers are pure, disk-cheap, and independent — running them
+    // serially costs nothing but wall clock. Studio's client-side task
+    // timeout is generous but not infinite, so shaving 200-400ms here is
+    // worth the flat map.
+    const parsed = definitions.map((definition, index) => {
+      const slot = run.agents[index];
       const started = Date.now();
       try {
-        // Each persona owns its facts: clearing first makes a re-run idempotent.
         this.store.clearAgentFacts(definition.agent);
-        const { facts, summary } = definition.run(target);
-        this.store.addFacts(facts);
-
-        slot.status = 'done';
-        slot.factCount = facts.length;
-        slot.summary = summary;
+        const result = definition.run(target);
+        this.store.addFacts(result.facts);
+        slot.summary = result.summary;
+        slot.factCount = result.facts.length;
+        return { index, definition, parseMs: Date.now() - started, ...result, error: null as string | null };
       } catch (error) {
-        // One agent failing must not abort the swarm — partial context still
-        // beats no context, and the failure is reported rather than swallowed.
+        const message = error instanceof Error ? error.message : String(error);
         slot.status = 'failed';
-        slot.error = error instanceof Error ? error.message : String(error);
-        ctx.logger.error(`Agent failed: ${definition.agent}`, { error: slot.error });
+        slot.error = message;
+        ctx.logger.error(`Parser failed: ${definition.agent}`, { error: message });
+        return {
+          index,
+          definition,
+          parseMs: Date.now() - started,
+          facts: [],
+          summary: '',
+          evidence: null,
+          error: message,
+        };
       }
-      slot.durationMs = Date.now() - started;
+    });
+    this.store.upsert('runs', run);
+    ctx.task?.updateProgress(`Parsers done — ${parsed.filter((p) => !p.error).length}/${definitions.length} succeeded`);
 
-      // Commit after every agent — this is what makes the run crash-survivable.
-      this.store.upsert('runs', run);
+    /* ------------------------- parallel LLM pass ------------------------- */
+    // Personas are independent: parallelising cuts wall-clock from
+    // sum-of-slowest to max-of-slowest, which is what keeps this within
+    // Studio's client-side timeout on paid models and gives free-tier models
+    // a fair shot before the tier limit bites.
+    if (llmAvailable) {
+      // Sub-budget each LLM call to a share of the swarm's remaining
+      // wall-clock. If the model is slow the individual call fails cleanly
+      // with a Deadline error rather than pinning the tool past Studio's
+      // client-side timeout.
+      const perCallBudget = Math.max(2000, budgetRemaining() - 1500);
+      const previousTimeout = process.env.BRIDGE_LLM_TIMEOUT_MS;
+      process.env.BRIDGE_LLM_TIMEOUT_MS = String(perCallBudget);
+      ctx.task?.updateProgress(
+        `Reasoning with ${this.llm.model} across ${parsed.length} personas in parallel (${perCallBudget}ms budget)`
+      );
+
+      type ReasoningOutcome =
+        | { entry: (typeof parsed)[number]; kind: 'ok'; usage: TokenUsage; facts: KnowledgeFact[] }
+        | { entry: (typeof parsed)[number]; kind: 'skipped'; detail: string };
+
+      const reasoningResults: ReasoningOutcome[] = await Promise.all(
+        parsed.map(async (entry): Promise<ReasoningOutcome> => {
+          if (entry.error) return { entry, kind: 'skipped', detail: entry.error };
+          const brief = PERSONA_BRIEFS[entry.definition.agent];
+          if (!brief) return { entry, kind: 'skipped', detail: 'no persona brief registered' };
+
+          try {
+            const reasoning = await this.llm.reason({
+              agent: entry.definition.agent,
+              system: brief.system,
+              evidence: this.renderEvidence(entry.evidence),
+              task: brief.question,
+              schema: ANALYSIS_SCHEMA,
+              validate: validateAnalysis,
+            });
+            if (reasoning.ok) {
+              return {
+                entry,
+                kind: 'ok',
+                usage: reasoning.data.usage,
+                facts: analysisToFacts(entry.definition.agent, reasoning.data.value),
+              };
+            }
+            return { entry, kind: 'skipped', detail: describeFailure(reasoning.failure) };
+          } catch (error) {
+            // The LLM service normally returns discriminated failures, but any
+            // sync throw (bug, uncaught SDK error) still lands here rather
+            // than aborting the whole promise-all and losing the other six.
+            return {
+              entry,
+              kind: 'skipped',
+              detail: error instanceof Error ? error.message : String(error),
+            };
+          }
+        })
+      );
+
+      // Restore the previous per-call timeout so a subsequent tool invocation
+      // starts from the operator-configured value, not our narrowed budget.
+      if (previousTimeout === undefined) delete process.env.BRIDGE_LLM_TIMEOUT_MS;
+      else process.env.BRIDGE_LLM_TIMEOUT_MS = previousTimeout;
+
+      for (const outcome of reasoningResults) {
+        const { entry } = outcome;
+        const slot = run.agents[entry.index];
+        let reasonedFacts = 0;
+        let llmSummary = '';
+
+        if (outcome.kind === 'ok') {
+          consecutiveRateLimits = 0;
+          this.store.addFacts(outcome.facts);
+          reasonedFacts = outcome.facts.length;
+          swarmUsage = addUsage(swarmUsage, outcome.usage);
+          llmSummary = ` · ${reasonedFacts} reasoned fact(s), $${outcome.usage.costUsd.toFixed(4)}`;
+          llmNotes.push({ agent: entry.definition.agent, reasonedFacts });
+        } else {
+          const detail = outcome.detail;
+          if (detail.toLowerCase().includes('rate limit')) {
+            consecutiveRateLimits += 1;
+            if (consecutiveRateLimits >= RATE_LIMIT_LATCH && !llmLatchedOff) {
+              llmLatchedOff = true;
+              ctx.logger.warn(
+                `LLM reasoning latched OFF for the rest of this run — ${consecutiveRateLimits} consecutive rate limits on ${this.llm.model}. ` +
+                  `Switch to a paid or less-throttled model with configure_llm.`
+              );
+            }
+          }
+          ctx.logger.warn(`LLM reasoning skipped for ${entry.definition.agent}: ${detail}`);
+          llmSummary = ` · llm ${detail}`;
+          llmNotes.push({ agent: entry.definition.agent, reasonedFacts: 0, failure: detail });
+        }
+
+        // Only mark done if the parser succeeded — a parser failure was
+        // already recorded and shouldn't be overwritten by LLM outcome.
+        if (slot.status !== 'failed') {
+          slot.status = 'done';
+          slot.factCount = entry.facts.length + reasonedFacts;
+          slot.summary = `${entry.summary}${llmSummary}`;
+          slot.durationMs = entry.parseMs;
+        }
+      }
+    } else {
+      // No LLM: mark parser-succeeded slots done as-is.
+      for (const entry of parsed) {
+        const slot = run.agents[entry.index];
+        if (slot.status !== 'failed') {
+          slot.status = 'done';
+          slot.durationMs = entry.parseMs;
+        }
+      }
     }
+
+    this.store.upsert('runs', run);
 
     /* ------------------------- conflict cross-reference ------------------------- */
     let openConflicts = 0;
@@ -182,6 +431,7 @@ export class SwarmTools {
     /* ------------------------------- synthesis ------------------------------- */
     let manifestPath: string | undefined;
     let manifestSkippedReason: string | undefined;
+    let briefingSummary: string | undefined;
 
     if (openConflicts > 0) {
       run.status = 'awaiting-resolution';
@@ -191,19 +441,69 @@ export class SwarmTools {
       ctx.task?.requestInput(
         `Swarm paused: ${openConflicts} context conflict(s) need an administrator decision.`
       );
-    } else if (input.synthesize !== false) {
-      ctx.task?.updateProgress('Synthesizing CLAUDE.md');
-      try {
-        const written = this.manifest.write(target);
-        manifestPath = this.workspace.rel(this.workspace.projectRoot, written.path);
-        run.manifestPath = manifestPath;
-        run.status = 'completed';
-      } catch (error) {
-        run.status = 'failed';
-        run.error = error instanceof Error ? error.message : String(error);
-      }
     } else {
-      run.status = 'completed';
+      // Master orchestrator: agentic tool-calling loop over the knowledge base,
+      // producing the executive briefing that opens CLAUDE.md. Runs before
+      // synthesis so the manifest can bake the briefing in. Skipped when the
+      // rate-limit latch is set, because sending it into the same throttled
+      // model would just delay the manifest.
+      if (llmAvailable && !llmLatchedOff && budgetRemaining() > 3000) {
+        // Orchestrator uses the swarm's remaining budget as its per-call cap
+        // too, for the same reason as the persona pass.
+        const orchestratorBudget = Math.max(2000, budgetRemaining() - 500);
+        const previousTimeout = process.env.BRIDGE_LLM_TIMEOUT_MS;
+        process.env.BRIDGE_LLM_TIMEOUT_MS = String(orchestratorBudget);
+        ctx.task?.updateProgress(
+          `Master orchestrator authoring executive briefing (${this.llm.model}, ${orchestratorBudget}ms budget)`
+        );
+        const outcome = await this.orchestrator.orchestrate(target, (note) => {
+          try {
+            ctx.task?.updateProgress(`orchestrator: ${note}`);
+          } catch {
+            /* task may already be closed; the LLM call itself is authoritative */
+          }
+        });
+        if (outcome.ok && outcome.briefing) {
+          swarmUsage = outcome.usage ? addUsage(swarmUsage, outcome.usage) : swarmUsage;
+          this.store.addFacts([
+            {
+              id: 'llm:orchestrator:briefing',
+              agent: 'orchestrator',
+              category: 'architecture',
+              title: 'Executive briefing',
+              detail: outcome.briefing,
+              evidence: outcome.calls.map((c) => `${c.name}(${JSON.stringify(c.input)})`),
+              weight: 6,
+              reasoned: true,
+            },
+          ]);
+          briefingSummary = `${outcome.calls.length} tool call(s), $${outcome.usage?.costUsd.toFixed(4) ?? '0.0000'}`;
+        } else if (outcome.reason) {
+          ctx.logger.warn(`Orchestrator briefing skipped: ${outcome.reason}`);
+          briefingSummary = `skipped: ${outcome.reason}`;
+        }
+        if (previousTimeout === undefined) delete process.env.BRIDGE_LLM_TIMEOUT_MS;
+        else process.env.BRIDGE_LLM_TIMEOUT_MS = previousTimeout;
+      } else if (llmLatchedOff) {
+        briefingSummary = 'skipped: rate-limit latch tripped during persona pass';
+      } else if (llmAvailable) {
+        briefingSummary = 'skipped: swarm budget exhausted before orchestrator could run';
+      }
+
+      if (input.synthesize !== false) {
+        ctx.task?.updateProgress('Synthesizing CLAUDE.md');
+        try {
+          const written = this.manifest.write(target);
+          manifestPath = this.workspace.rel(this.workspace.projectRoot, written.path);
+          run.manifestPath = manifestPath;
+          run.status = 'completed';
+        } catch (error) {
+          run.status = 'failed';
+          run.error = error instanceof Error ? error.message : String(error);
+        }
+      } else {
+        run.status = 'completed';
+      }
     }
 
     run.finishedAt = new Date().toISOString();
@@ -215,6 +515,7 @@ export class SwarmTools {
       status: run.status,
       facts: facts.length,
       openConflicts,
+      llmCostUsd: swarmUsage.costUsd.toFixed(4),
     });
 
     return {
@@ -231,13 +532,44 @@ export class SwarmTools {
       generatedSkills: this.store.all('skills').length,
       manifestPath,
       manifestSkippedReason,
+      llm: {
+        enabled: llmAvailable,
+        description: this.llm.description,
+        totalInputTokens: swarmUsage.input,
+        totalOutputTokens: swarmUsage.output,
+        cacheReadTokens: swarmUsage.cacheRead,
+        cacheWriteTokens: swarmUsage.cacheWrite,
+        totalCostUsd: Number(swarmUsage.costUsd.toFixed(6)),
+        perAgent: llmNotes,
+        briefing: briefingSummary,
+      },
       nextStep:
         openConflicts > 0
           ? 'Resolve the conflict(s), then the manifest will generate.'
           : manifestPath
             ? `Manifest written to ${manifestPath}. Open it, or call query_knowledge to interrogate the graph.`
             : 'Call synthesize_claude_md to write the manifest.',
+      buildStamp: SWARM_TOOL_BUILD,
     };
+  }
+
+  /**
+   * Render a persona's deterministic evidence as text the model can reason over.
+   *
+   * The parsers return well-formed objects; JSON stringification with a small
+   * amount of indentation preserves nesting without inflating tokens. A trailing
+   * cap keeps a pathological input from blowing the cache breakpoint.
+   */
+  private renderEvidence(evidence: unknown): string {
+    const MAX = 60_000;
+    let text: string;
+    try {
+      text = typeof evidence === 'string' ? evidence : JSON.stringify(evidence, null, 2);
+    } catch {
+      text = String(evidence);
+    }
+    if (text.length <= MAX) return text;
+    return `${text.slice(0, MAX)}\n… (evidence truncated at ${MAX} chars)`;
   }
 
   @Tool({
@@ -333,6 +665,7 @@ export class SwarmTools {
           return {
             facts,
             summary: `${map.fileCount} files, ${Object.keys(map.layers).length} layers, ${map.hotspots.length} hotspots`,
+            evidence: map,
           };
         },
       },
@@ -373,6 +706,7 @@ export class SwarmTools {
           return {
             facts,
             summary: `${report.dependencies.length} deps across ${report.manifests.length} manifest(s), ${report.agingSignals.length} aging signal(s)`,
+            evidence: report,
           };
         },
       },
@@ -457,6 +791,7 @@ export class SwarmTools {
           return {
             facts,
             summary: `${report.frameworks.length} runner(s), ${report.writtenPolicies.length} written policy(ies)`,
+            evidence: report,
           };
         },
       },
@@ -525,6 +860,7 @@ export class SwarmTools {
           return {
             facts,
             summary: `${report.pipelines.length} pipeline(s), commit convention ${report.commitConvention ? 'recovered' : 'not found'}`,
+            evidence: report,
           };
         },
       },
@@ -557,7 +893,11 @@ export class SwarmTools {
               weight: issue.status.toLowerCase().includes('progress') ? 4 : 3,
             })),
           ];
-          return { facts, summary: `sprint "${sprint.sprint.name}", ${inFlight.length} open issue(s)` };
+          return {
+            facts,
+            summary: `sprint "${sprint.sprint.name}", ${inFlight.length} open issue(s)`,
+            evidence: sprint,
+          };
         },
       },
       {
@@ -588,7 +928,11 @@ export class SwarmTools {
               weight: d.authority === 'lead' || d.authority === 'ops' ? 5 : 3,
             })),
           ];
-          return { facts, summary: `${binding.length} binding directive(s) extracted` };
+          return {
+            facts,
+            summary: `${binding.length} binding directive(s) extracted`,
+            evidence: { transcript, binding },
+          };
         },
       },
       {
@@ -662,6 +1006,7 @@ export class SwarmTools {
           return {
             facts,
             summary: `${report.tokens.length} token(s), ${report.components.length} component(s), ${report.adHocColors.length} ad-hoc colour(s)`,
+            evidence: report,
           };
         },
       },

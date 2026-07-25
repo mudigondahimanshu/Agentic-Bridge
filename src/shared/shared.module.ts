@@ -5,6 +5,8 @@ import { SemanticService } from './services/semantic.service.js';
 import { AuthService } from './services/auth.service.js';
 import { HttpHardeningService } from './services/http-hardening.service.js';
 import { PdfTextService } from './services/pdf-text.service.js';
+import { LlmService } from './services/llm.service.js';
+import { KnowledgeSearchService } from './services/knowledge-search.service.js';
 import { AdminGuard } from './security/admin.guard.js';
 
 /**
@@ -16,7 +18,7 @@ import { AdminGuard } from './security/admin.guard.js';
  */
 @Module({
   name: 'shared',
-  description: 'Workspace, durable store, semantic search and transport security',
+  description: 'Workspace, durable store, semantic search, LLM reasoning and transport security',
   providers: [
     WorkspaceService,
     StoreService,
@@ -25,6 +27,8 @@ import { AdminGuard } from './security/admin.guard.js';
     AdminGuard,
     HttpHardeningService,
     PdfTextService,
+    LlmService,
+    KnowledgeSearchService,
   ],
   exports: [
     WorkspaceService,
@@ -33,6 +37,8 @@ import { AdminGuard } from './security/admin.guard.js';
     AuthService,
     AdminGuard,
     PdfTextService,
+    LlmService,
+    KnowledgeSearchService,
   ],
 })
 export class SharedModule {}

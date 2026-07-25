@@ -23,8 +23,13 @@ import { setServer } from './shared/services/server-registry.js';
 import { ensureWidgetsBuilt } from './shared/ensure-widgets.js';
 import { SkillRuntimeService } from './modules/skills/skill-runtime.service.js';
 import { AuthService } from './shared/services/auth.service.js';
+import { LlmService } from './shared/services/llm.service.js';
 import { applyTransportEnv } from './shared/transport.js';
 import { applyJsonBodyLimit, hardeningState } from './shared/services/http-hardening.service.js';
+
+// Compile-time build stamp: if this string doesn't appear in the boot banner,
+// Studio is running stale code and needs its server restarted.
+const BUILD_STAMP = '2026-07-26T04:05-swarm-budget+studio-timeout-fit';
 
 async function bootstrap() {
   // NitroStack picks its transport from MCP_TRANSPORT_TYPE and its listen
@@ -56,6 +61,7 @@ async function bootstrap() {
   try {
     const auth = DIContainer.getInstance().resolve(AuthService) as AuthService;
     const state = hardeningState();
+    console.error(`[bridge] Build stamp: ${BUILD_STAMP}`);
     console.error(
       `[bridge] Transport: ${transport.type}` +
         (transport.type === 'stdio' ? '' : ` on ${transport.host}:${transport.port}/mcp`)
@@ -64,6 +70,14 @@ async function bootstrap() {
       `[bridge] Security: auth ${auth.description}; scope=${state.authScope}; ` +
         `JSON body limit ${state.jsonBodyLimit} (via ${state.jsonBodyLimitVia})` +
         (state.httpEdgeInstalled ? '; HTTP auth edge installed' : '')
+    );
+
+    const llm = DIContainer.getInstance().resolve(LlmService) as LlmService;
+    console.error(
+      `[bridge] LLM reasoning: ${llm.available ? 'ON' : 'OFF'} (${llm.description})` +
+        (llm.available
+          ? ''
+          : ' — set OPENROUTER_API_KEY (or call the configure_llm tool) to enable persona reasoning and the master orchestrator.')
     );
   } catch {
     // Diagnostics only — never a reason to fail a boot that otherwise succeeded.
