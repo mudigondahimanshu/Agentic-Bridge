@@ -22,12 +22,33 @@ export class UiUxTools {
       'component inventory ranked by real usage. Also flags ad-hoc hex colours that violate ' +
       'the token set, so generated UI matches the house style instead of inventing one.',
     inputSchema: TargetSchema,
+    // Studio renders this in the widget preview before the tool is ever run, so
+    // it has to be a faithful sample of the real shape. A component without
+    // `props` previously crashed the preview on `component.props.length`.
     examples: {
       request: {},
       response: {
         framework: ['Tailwind CSS', 'CSS custom properties', 'React'],
-        palette: [{ name: '--aur-color-navy', value: '#0B2545' }],
-        components: [{ name: 'DataTable', path: 'web/src/components/DataTable.jsx', usageCount: 1 }],
+        tokens: [
+          { name: '--aur-space-gutter', value: '18px', category: 'spacing' },
+          { name: '--aur-radius-card', value: '2px', category: 'radius' },
+        ],
+        palette: [
+          { name: 'aurora-navy', value: '#0B2545' },
+          { name: 'aurora-signal', value: '#C1440E' },
+        ],
+        typography: [{ name: 'sans', value: "'Inter Tight', 'Helvetica Neue', sans-serif" }],
+        components: [
+          {
+            name: 'DataTable',
+            path: 'web/src/components/DataTable.jsx',
+            usageCount: 1,
+            props: ['columns={…}', 'rows={…}', 'onRowClick={…}'],
+            note: 'Canonical table. Every list view in Aurora MUST use this, not a raw <table>.',
+          },
+        ],
+        adHocColors: [],
+        note: 'Aurora Design Language v3 — approved by Brand Council 2019-04. Do not add ad-hoc colours.',
       },
     },
   })

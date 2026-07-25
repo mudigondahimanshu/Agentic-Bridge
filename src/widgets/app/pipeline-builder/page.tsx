@@ -73,10 +73,15 @@ export default function PipelineBuilder() {
   // Seed the canvas from a saved pipeline the first time one arrives, but never
   // clobber edits the administrator has already made in this session.
   useEffect(() => {
-    if (seeded || !data?.pipeline) return;
-    setName(data.pipeline.name);
+    // `pipeline` is not one shape across the tools that feed this widget:
+    // get_pipeline returns the full object, while run_pipeline returns just the
+    // NAME as a string. Seeding the canvas only makes sense for the former, and
+    // reading .nodes off the latter is what crashed this widget.
+    const saved = data?.pipeline;
+    if (seeded || !saved || typeof saved !== 'object' || !Array.isArray(saved.nodes)) return;
+    setName(saved.name);
     setStages(
-      data.pipeline.nodes.map((n) => ({
+      saved.nodes.map((n) => ({
         id: n.id,
         type: n.type,
         requiresApproval: !!n.requiresApproval,

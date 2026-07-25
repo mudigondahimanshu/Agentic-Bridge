@@ -42,7 +42,10 @@ export default function ConflictResolver() {
   const [custom, setCustom] = useState<Record<string, string>>({});
   const [expanded, setExpanded] = useState<string | null>(null);
 
-  const conflicts = data?.conflicts ?? [];
+  // Every row dereferences sourceA/sourceB directly, so a conflict missing either
+  // one takes the whole widget down with an unhandled TypeError. Rendering a
+  // partial list — or the empty state — is always better than a red error box.
+  const conflicts = (data?.conflicts ?? []).filter((c) => c?.sourceA && c?.sourceB);
   const open = conflicts.filter((c) => c.status === 'open');
   const resolved = conflicts.filter((c) => c.status === 'resolved');
 

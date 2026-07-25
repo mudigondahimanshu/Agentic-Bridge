@@ -25,20 +25,43 @@ export class ConflictTools {
       jira_source: z.string().optional().describe('Override path to the Jira fixture'),
       transcript_source: z.string().optional().describe('Override path to the transcript fixture'),
     }),
+    // Studio renders this payload in the widget preview before the tool is ever
+    // run, so it must be a faithful sample of the real return shape — not a
+    // summary. Omitting sourceA/sourceB previously crashed the preview outright.
     examples: {
       request: {},
       response: {
         conflictCount: 1,
+        openCount: 1,
+        thresholds: { driftBelow: 0.7, contradictionAtOrAbove: 0.6 },
+        sources: {
+          jira: 'AUR / Sprint 41 - Invoice Read Path',
+          teams: 'Microsoft Teams — Aurora Billing / Sprint 41 Daily Scrum',
+        },
         conflicts: [
           {
             id: 'conflict-AUR-4471-decision-3',
             kind: 'contradiction',
             topic: 'redis, memcached, cache',
-            similarity: 0.41,
+            similarity: 0.2073,
             divergence: 1,
+            status: 'open',
             recommendation: 'b',
+            recommendationReason:
+              'source B explicitly rejects "redis", which source A adopts. The meeting statement is more recent and came from the lead.',
+            sourceA: {
+              origin: 'Jira',
+              ref: 'AUR-4471',
+              text: 'Introduce a Redis cache in front of the invoice read path — replace the Memcached wrapper in server/middleware/cache.js with a Redis client.',
+            },
+            sourceB: {
+              origin: 'Microsoft Teams',
+              ref: 'Sprint 41 Daily Scrum 10:04 D. Fairbanks',
+              text: 'So the decision is: we are NOT introducing Redis. We stay on Memcached and we optimise the existing wrapper instead.',
+            },
           },
         ],
+        nextStep: 'Resolve each conflict in the widget, or call resolve_conflict with the conflict_id.',
       },
     },
   })
@@ -81,7 +104,24 @@ export class ConflictTools {
     inputSchema: ConflictResolutionSchema,
     examples: {
       request: { conflict_id: 'conflict-AUR-4471-decision-3', chosen: 'b', resolved_by: 'admin' },
-      response: { resolved: true, remainingOpen: 0 },
+      // `remainingOpen` is not a real field on this response — it only appears in
+      // the log line. The widget reads conflicts/openCount, so advertise those.
+      response: {
+        resolved: true,
+        conflictCount: 1,
+        openCount: 0,
+        conflict: {
+          id: 'conflict-AUR-4471-decision-3',
+          status: 'resolved',
+          resolution: {
+            chosen: 'b',
+            directive: 'Authoritative: Microsoft Teams. Stay on Memcached; no Redis in the PCI zone.',
+            resolvedBy: 'admin',
+            resolvedAt: '2026-07-25T10:12:00.000Z',
+          },
+        },
+        nextStep: 'All conflicts resolved — run synthesize_claude_md to write the manifest.',
+      },
     },
   })
   @Widget('conflict-resolver')
@@ -136,7 +176,44 @@ export class ConflictTools {
     inputSchema: z.object({
       only_open: z.boolean().default(false).describe('Return only unresolved conflicts'),
     }),
-    examples: { request: { only_open: true }, response: { conflictCount: 0, conflicts: [] } },
+    // Mirrors a real post-resolution payload, so the widget preview shows the
+    // interesting state (a human ruling on record) rather than an empty list.
+    examples: {
+      request: { only_open: false },
+      response: {
+        conflictCount: 1,
+        openCount: 0,
+        conflicts: [
+          {
+            id: 'conflict-AUR-4471-decision-2',
+            kind: 'contradiction',
+            topic: 'redis, memcached, cache',
+            similarity: 0.2073,
+            divergence: 1,
+            status: 'resolved',
+            recommendation: 'b',
+            recommendationReason:
+              'source B explicitly rejects "redis", which source A adopts. The meeting statement is more recent and came from ops.',
+            sourceA: {
+              origin: 'Jira',
+              ref: 'AUR-4471',
+              text: 'Introduce a Redis cache in front of the invoice read path — replace the Memcached wrapper in server/middleware/cache.js with a Redis client.',
+            },
+            sourceB: {
+              origin: 'Microsoft Teams',
+              ref: 'Sprint 41 Daily Scrum 10:03 K. Brandt',
+              text: 'Ops will not approve Redis in the PCI zone. That was ADR-014 in 2023 and nothing has changed.',
+            },
+            resolution: {
+              chosen: 'b',
+              directive: 'Authoritative: Microsoft Teams. Ops will not approve Redis in the PCI zone; stay on Memcached.',
+              resolvedBy: 'administrator',
+              resolvedAt: '2026-07-25T10:12:00.000Z',
+            },
+          },
+        ],
+      },
+    },
   })
   @Widget('conflict-resolver')
   async listConflicts(input: { only_open?: boolean }) {

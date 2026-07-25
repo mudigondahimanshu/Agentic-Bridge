@@ -133,7 +133,7 @@ export default function DesignSystem() {
                   <div className="bx-item-t" style={{ fontFamily: 'var(--bx-mono)' }}>
                     {'<'}
                     {component.name}
-                    {component.props.length ? ` ${component.props.join(' ')}` : ''} {'/>'}
+                    {component.props?.length ? ` ${component.props.join(' ')}` : ''} {'/>'}
                   </div>
                   <div className="bx-item-d">
                     {component.doc ? `${component.doc} — ` : ''}
