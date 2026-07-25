@@ -1,8 +1,11 @@
-import { Injectable, ToolDecorator as Tool, Widget, ExecutionContext, z } from '@nitrostack/core';
+import { Injectable, ToolDecorator as Tool, Widget, ExecutionContext, z, UseGuards } from '@nitrostack/core';
+import { AdminGuard } from '../../shared/security/admin.guard.js';
 import * as path from 'path';
+import * as fs from 'fs';
 import { ManifestService } from './manifest.service.js';
 import { WorkspaceService } from '../../shared/services/workspace.service.js';
 import { StoreService } from '../../shared/services/store.service.js';
+import { PdfTextService } from '../../shared/services/pdf-text.service.js';
 import { TargetSchema } from '../../shared/schemas/index.js';
 import type { IngestedDocument } from '../../shared/services/store.service.js';
 
@@ -10,12 +13,13 @@ import type { IngestedDocument } from '../../shared/services/store.service.js';
 const CHUNK_CHARS = 900;
 const CHUNK_OVERLAP = 120;
 
-@Injectable({ deps: [ManifestService, WorkspaceService, StoreService] })
+@Injectable({ deps: [ManifestService, WorkspaceService, StoreService, PdfTextService] })
 export class SynthesisTools {
   constructor(
     private manifest: ManifestService,
     private workspace: WorkspaceService,
-    private store: StoreService
+    private store: StoreService,
+    private pdf: PdfTextService
   ) {}
 
   @Tool({
@@ -49,6 +53,7 @@ export class SynthesisTools {
     },
   })
   @Widget('claude-manifest')
+  @UseGuards(AdminGuard)
   async synthesizeClaudeMd(
     input: { target?: string; output_path?: string; allow_unresolved?: boolean },
     ctx: ExecutionContext
@@ -106,19 +111,31 @@ export class SynthesisTools {
       'a wiki, a PDF the team never checked in, a Slack thread pasted as text. The document is ' +
       'chunked, embedded into the same vector space the rest of the knowledge base uses, and ' +
       'becomes searchable via query_knowledge and included in the next manifest. Accepts ' +
-      'inline text or a file path.',
+      'inline text, a file path, or a base64 upload from the dashboard dropzone. PDFs are ' +
+      'parsed for their text layer, so an ADR that only ever existed as a PDF can be ingested ' +
+      'directly.',
     inputSchema: z
       .object({
         name: z.string().min(1).describe('A short title for the document'),
         text: z.string().optional().describe('The document content as plain text'),
-        file_path: z.string().optional().describe('Absolute path to a UTF-8 text/markdown file to read instead'),
+        file_path: z
+          .string()
+          .optional()
+          .describe('Absolute path to a text, markdown or PDF file to read instead'),
+        file_base64: z
+          .string()
+          .optional()
+          .describe(
+            'Base64-encoded file contents, as uploaded from the dashboard dropzone. PDF, text ' +
+              'and markdown are supported. A `data:` URL prefix is accepted and stripped.'
+          ),
         category_hint: z
           .enum(['architecture', 'testing', 'cicd', 'agile', 'consensus', 'design-system', 'manual'])
           .default('manual')
           .describe('Which section of the manifest this belongs in'),
       })
-      .refine((v) => !!(v.text?.trim() || v.file_path?.trim()), {
-        message: 'Provide either `text` or `file_path`.',
+      .refine((v) => !!(v.text?.trim() || v.file_path?.trim() || v.file_base64?.trim()), {
+        message: 'Provide one of `text`, `file_path` or `file_base64`.',
       }),
     examples: {
       request: { name: 'ADR-014 caching decision', text: 'Redis was rejected because…' },
@@ -126,27 +143,63 @@ export class SynthesisTools {
     },
   })
   @Widget('claude-manifest')
+  @UseGuards(AdminGuard)
   async ingestManualDocument(
-    input: { name: string; text?: string; file_path?: string; category_hint?: string },
+    input: {
+      name: string;
+      text?: string;
+      file_path?: string;
+      file_base64?: string;
+      category_hint?: string;
+    },
     ctx: ExecutionContext
   ) {
     let content = input.text?.trim() ?? '';
     let mimeType = 'text/plain';
+    const warnings: string[] = [];
+    let pdfPages: number | undefined;
+
+    // A base64 upload is the dashboard path: the browser cannot hand us a server
+    // filesystem path, so the dropzone posts the bytes.
+    if (!content && input.file_base64) {
+      const payload = input.file_base64.replace(/^data:[^;,]*;base64,/, '').trim();
+      const buffer = Buffer.from(payload, 'base64');
+      if (!buffer.length) {
+        throw new Error('`file_base64` did not decode to any bytes.');
+      }
+      const decoded = this.decodeUpload(buffer, input.name);
+      content = decoded.text;
+      mimeType = decoded.mimeType;
+      pdfPages = decoded.pages;
+      warnings.push(...decoded.warnings);
+    }
 
     if (!content && input.file_path) {
       const resolved = path.resolve(input.file_path);
-      const text = this.workspace.read(resolved);
-      if (text === null) {
+      let buffer: Buffer;
+      try {
+        buffer = fs.readFileSync(resolved);
+      } catch {
         throw new Error(
-          `Could not read ${resolved}. Provide a UTF-8 text or markdown file, or paste the ` +
+          `Could not read ${resolved}. Provide a text, markdown or PDF file, or paste the ` +
             `content into the \`text\` parameter instead.`
         );
       }
-      content = text;
-      mimeType = resolved.endsWith('.md') ? 'text/markdown' : 'text/plain';
+      const decoded = this.decodeUpload(buffer, resolved);
+      content = decoded.text;
+      mimeType = decoded.mimeType;
+      pdfPages = decoded.pages;
+      warnings.push(...decoded.warnings);
     }
 
-    if (!content) throw new Error('Document is empty — nothing to ingest.');
+    if (!content) {
+      throw new Error(
+        pdfPages !== undefined
+          ? 'The PDF carried no extractable text layer — it is almost certainly a scan and ' +
+            'needs OCR before the bridge can index it.'
+          : 'Document is empty — nothing to ingest.'
+      );
+    }
 
     const chunks = this.chunk(content).map((text, i) => ({ id: `chunk-${i + 1}`, text }));
     const doc: IngestedDocument = {
@@ -178,10 +231,49 @@ export class SynthesisTools {
 
     return {
       ingested: true,
-      document: { id: doc.id, name: doc.name, chars: doc.chars },
+      document: { id: doc.id, name: doc.name, chars: doc.chars, mimeType },
       chunks: chunks.length,
+      ...(pdfPages !== undefined ? { pdfPages } : {}),
+      ...(warnings.length ? { warnings } : {}),
       totalDocuments: this.store.all('documents').length,
       nextStep: 'Re-run synthesize_claude_md to fold this into the manifest.',
+    };
+  }
+
+  /**
+   * Turn uploaded bytes into text.
+   *
+   * Detection is by magic bytes rather than by extension: the dashboard dropzone
+   * reports whatever name the operating system gave the file, and an ADR saved
+   * as `decision.doc` that is really a PDF should still be readable.
+   */
+  private decodeUpload(
+    buffer: Buffer,
+    nameOrPath: string
+  ): { text: string; mimeType: string; pages?: number; warnings: string[] } {
+    if (PdfTextService.isPdf(buffer)) {
+      const extracted = this.pdf.extract(buffer);
+      return {
+        text: extracted.text,
+        mimeType: 'application/pdf',
+        pages: extracted.pages,
+        warnings: extracted.warnings,
+      };
+    }
+
+    const text = buffer.toString('utf8');
+    // A NUL byte is the reliable tell that this is a binary format we have no
+    // extractor for; better to say so than to embed mojibake into the manifest.
+    if (text.includes('\u0000')) {
+      throw new Error(
+        `${nameOrPath} is a binary file the bridge cannot read. Supported uploads are PDF, ` +
+          `plain text and markdown — export it, or paste the text into the \`text\` parameter.`
+      );
+    }
+    return {
+      text,
+      mimeType: /\.mdx?$/i.test(nameOrPath) ? 'text/markdown' : 'text/plain',
+      warnings: [],
     };
   }
 
@@ -198,6 +290,7 @@ export class SynthesisTools {
     }),
     examples: { request: { confirm: true }, response: { reset: true } },
   })
+  @UseGuards(AdminGuard)
   async resetBridge(input: { confirm: boolean }, ctx: ExecutionContext) {
     if (!input.confirm) {
       return { reset: false, message: 'No changes made. Pass confirm=true to actually reset.' };

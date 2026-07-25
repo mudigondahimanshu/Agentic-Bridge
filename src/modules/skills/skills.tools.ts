@@ -1,4 +1,5 @@
-import { Injectable, ToolDecorator as Tool, Widget, ExecutionContext, z } from '@nitrostack/core';
+import { Injectable, ToolDecorator as Tool, Widget, ExecutionContext, z, UseGuards } from '@nitrostack/core';
+import { AdminGuard } from '../../shared/security/admin.guard.js';
 import { SkillRuntimeService } from './skill-runtime.service.js';
 import { WorkspaceService } from '../../shared/services/workspace.service.js';
 import { StoreService } from '../../shared/services/store.service.js';
@@ -41,6 +42,7 @@ export class SkillsTools {
     },
   })
   @Widget('skill-forge')
+  @UseGuards(AdminGuard)
   async generateCustomSkill(input: SkillSpec & { dry_run?: boolean }, ctx: ExecutionContext) {
     if (!this.runtime.generationEnabled) {
       throw new Error(

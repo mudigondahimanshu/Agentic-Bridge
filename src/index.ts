@@ -1,13 +1,20 @@
 /**
  * Enterprise Agentic Bridge — MCP server entry point.
  *
- * Two things happen here beyond the standard NitroStack bootstrap:
+ * Four things happen here beyond the standard NitroStack bootstrap:
  *
- *   1. The live server instance is stashed in the server registry. That is what
+ *   1. The HTTP JSON body limit is raised to 50mb before the transport is built.
+ *      This has to happen here, not in a module: NitroStack constructs its
+ *      Express app during `start()` and the parser closes over its options at
+ *      construction, so any later configuration is too late. See
+ *      `HttpHardeningService` for why the default 100kb is disqualifying.
+ *   2. The live server instance is stashed in the server registry. That is what
  *      lets `generate_custom_skill` register a brand-new MCP tool on the running
  *      server and have it appear in the client's tool list without a restart.
- *   2. Previously generated skills are rehydrated from the durable registry, so
+ *   3. Previously generated skills are rehydrated from the durable registry, so
  *      a restart does not lose the swarm's work.
+ *   4. The effective security posture is logged, because "auth is configured"
+ *      is not something an operator should have to infer from a failed request.
  */
 import 'dotenv/config';
 import { McpApplicationFactory, DIContainer } from '@nitrostack/core';
@@ -15,11 +22,29 @@ import { AppModule } from './app.module.js';
 import { setServer } from './shared/services/server-registry.js';
 import { ensureWidgetsBuilt } from './shared/ensure-widgets.js';
 import { SkillRuntimeService } from './modules/skills/skill-runtime.service.js';
+import { AuthService } from './shared/services/auth.service.js';
+import { applyTransportEnv } from './shared/transport.js';
+import { applyJsonBodyLimit, hardeningState } from './shared/services/http-hardening.service.js';
 
 async function bootstrap() {
+  // NitroStack picks its transport from MCP_TRANSPORT_TYPE and its listen
+  // address from PORT/HOST, ignoring the @McpApp transport block. Translate this
+  // project's BRIDGE_TRANSPORT into those before anything reads them, or
+  // BRIDGE_TRANSPORT=http silently starts a stdio server.
+  const transport = applyTransportEnv();
+
   // Must run before create(): the factory resolves every @Widget route to a
   // static export while building the tool list, and throws if one is missing.
   ensureWidgetsBuilt();
+
+  // Must run before start(): the Express json parser is built during start().
+  const hardening = await applyJsonBodyLimit();
+  if (hardening.jsonBodyLimitVia === 'failed') {
+    console.error(
+      `[bridge] Could not raise the HTTP JSON body limit ahead of transport construction ` +
+        `(${hardening.jsonBodyLimitError}). Falling back to in-place router patching at bootstrap.`
+    );
+  }
 
   const server = await McpApplicationFactory.create(AppModule);
 
@@ -27,6 +52,22 @@ async function bootstrap() {
   setServer(server);
 
   await server.start();
+
+  try {
+    const auth = DIContainer.getInstance().resolve(AuthService) as AuthService;
+    const state = hardeningState();
+    console.error(
+      `[bridge] Transport: ${transport.type}` +
+        (transport.type === 'stdio' ? '' : ` on ${transport.host}:${transport.port}/mcp`)
+    );
+    console.error(
+      `[bridge] Security: auth ${auth.description}; scope=${state.authScope}; ` +
+        `JSON body limit ${state.jsonBodyLimit} (via ${state.jsonBodyLimitVia})` +
+        (state.httpEdgeInstalled ? '; HTTP auth edge installed' : '')
+    );
+  } catch {
+    // Diagnostics only — never a reason to fail a boot that otherwise succeeded.
+  }
 
   // Re-register skills the swarm minted in a previous session.
   try {

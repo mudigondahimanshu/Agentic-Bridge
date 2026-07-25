@@ -11,7 +11,8 @@
  * expressed through MCP Tasks (`ctx.task`), which is the protocol-native way to
  * do exactly this — see `taskSupport: 'optional'` below.
  */
-import { Injectable, ToolDecorator as Tool, Widget, ExecutionContext, z } from '@nitrostack/core';
+import { Injectable, ToolDecorator as Tool, Widget, ExecutionContext, z, UseGuards } from '@nitrostack/core';
+import { AdminGuard } from '../../shared/security/admin.guard.js';
 import { CodebaseService } from '../codebase/codebase.service.js';
 import { DocumentationService } from '../documentation/documentation.service.js';
 import { QaService } from '../qa/qa.service.js';
@@ -106,6 +107,7 @@ export class SwarmTools {
     },
   })
   @Widget('swarm-console')
+  @UseGuards(AdminGuard)
   async runSwarm(
     input: { target?: string; synthesize?: boolean; detect_conflicts?: boolean },
     ctx: ExecutionContext

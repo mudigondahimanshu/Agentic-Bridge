@@ -1,4 +1,5 @@
-import { Injectable, ToolDecorator as Tool, Widget, ExecutionContext, z } from '@nitrostack/core';
+import { Injectable, ToolDecorator as Tool, Widget, ExecutionContext, z, UseGuards } from '@nitrostack/core';
+import { AdminGuard } from '../../shared/security/admin.guard.js';
 import { ConflictService, DRIFT_THRESHOLD, CONTRADICTION_THRESHOLD } from './conflict.service.js';
 import { AgileService } from '../agile/agile.service.js';
 import { StoreService } from '../../shared/services/store.service.js';
@@ -66,6 +67,7 @@ export class ConflictTools {
     },
   })
   @Widget('conflict-resolver')
+  @UseGuards(AdminGuard)
   async detectConflicts(
     input: { jira_source?: string; transcript_source?: string },
     ctx: ExecutionContext
@@ -125,6 +127,7 @@ export class ConflictTools {
     },
   })
   @Widget('conflict-resolver')
+  @UseGuards(AdminGuard)
   async resolveConflict(
     input: { conflict_id: string; chosen: 'a' | 'b' | 'custom'; directive?: string; resolved_by?: string },
     ctx: ExecutionContext

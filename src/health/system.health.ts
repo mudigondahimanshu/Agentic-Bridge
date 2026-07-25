@@ -13,6 +13,10 @@ import {
 import * as fs from 'fs';
 import { WorkspaceService } from '../shared/services/workspace.service.js';
 import { StoreService } from '../shared/services/store.service.js';
+import { AuthService } from '../shared/services/auth.service.js';
+import { hardeningState } from '../shared/services/http-hardening.service.js';
+import { EffectsService } from '../modules/pipeline/effects.service.js';
+import { resolveTransportType } from '../shared/transport.js';
 
 @HealthCheck({
   name: 'system',
@@ -61,6 +65,56 @@ export class FixtureHealthCheck implements HealthCheckInterface {
         dataRoot: this.workspace.dataRoot,
         dataPresent: String(data),
         allowedRoots: this.workspace.allowedRoots.join(', '),
+      },
+    };
+  }
+}
+
+@HealthCheck({
+  name: 'security',
+  description: 'Transport, payload limits, credential enforcement and wired integrations',
+  interval: 60,
+})
+@Injectable({ deps: [AuthService, EffectsService] })
+export class SecurityHealthCheck implements HealthCheckInterface {
+  constructor(
+    private auth: AuthService,
+    private effects: EffectsService
+  ) {}
+
+  async check(): Promise<HealthCheckResult> {
+    const state = hardeningState();
+    const transport = resolveTransportType();
+    const remote = transport !== 'stdio';
+
+    // An unauthenticated remote surface is the one configuration worth
+    // flagging: over stdio the client is already a trusted local process, but a
+    // listening socket with no credential is an open door.
+    const exposed = remote && !this.auth.enabled;
+    // A body limit that silently failed to apply would cap ingestion at 100kb
+    // without anyone noticing until a large upload was rejected.
+    const limitBroken = remote && state.jsonBodyLimitVia === 'failed';
+
+    const integrations = this.effects.describeConfiguration();
+
+    return {
+      status: exposed || limitBroken ? 'degraded' : 'up',
+      message: exposed
+        ? 'HTTP transport is listening with no credential configured — set BRIDGE_ADMIN_API_KEY'
+        : limitBroken
+          ? `JSON body limit could not be applied (${state.jsonBodyLimitError})`
+          : `Transport ${transport}; auth ${this.auth.description}`,
+      details: {
+        transport,
+        auth: this.auth.description,
+        authScope: state.authScope,
+        httpAuthEdge: String(state.httpEdgeInstalled),
+        jsonBodyLimit: `${state.jsonBodyLimit} (${state.jsonBodyLimitVia})`,
+        sideEffectIntegrations:
+          Object.entries(integrations)
+            .filter(([, wired]) => wired)
+            .map(([name]) => name)
+            .join(', ') || 'none',
       },
     };
   }

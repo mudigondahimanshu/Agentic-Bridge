@@ -20,8 +20,10 @@ interface Payload {
   content?: string;
   // ingest_manual_document shares this widget
   ingested?: boolean;
-  document?: { id: string; name: string; chars: number };
+  document?: { id: string; name: string; chars: number; mimeType?: string };
   chunks?: number;
+  pdfPages?: number;
+  warnings?: string[];
   totalDocuments?: number;
   nextStep?: string;
 }
@@ -31,20 +33,51 @@ export default function ClaudeManifest() {
   const [docName, setDocName] = useState('');
   const [docText, setDocText] = useState('');
   const [showIngest, setShowIngest] = useState(false);
+  /** Set for binary uploads (PDFs), where there is no text to show in the box. */
+  const [docBase64, setDocBase64] = useState<string | null>(null);
+  const [readError, setReadError] = useState<string | null>(null);
 
   const ingest = async () => {
-    const ok = await run('ingest_manual_document', { name: docName.trim(), text: docText });
+    const ok = await run('ingest_manual_document', {
+      name: docName.trim(),
+      // A PDF goes up as bytes and is parsed server-side; anything textual goes
+      // up as text so the administrator can edit it before ingesting.
+      ...(docBase64 ? { file_base64: docBase64 } : { text: docText }),
+    });
     if (ok) {
       setDocName('');
       setDocText('');
+      setDocBase64(null);
     }
   };
 
   const readDroppedFile = async (file: File) => {
-    const text = await file.text();
+    setReadError(null);
     setDocName(file.name);
-    setDocText(text);
     setShowIngest(true);
+
+    const isPdf = file.type === 'application/pdf' || /\.pdf$/i.test(file.name);
+    if (!isPdf) {
+      setDocBase64(null);
+      setDocText(await file.text());
+      return;
+    }
+
+    try {
+      // btoa() only accepts binary strings, so the bytes are fed through in
+      // chunks — spreading a multi-megabyte array into String.fromCharCode
+      // overflows the call stack.
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      let binary = '';
+      for (let i = 0; i < bytes.length; i += 0x8000) {
+        binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+      }
+      setDocBase64(btoa(binary));
+      setDocText('');
+    } catch {
+      setDocBase64(null);
+      setReadError(`Could not read ${file.name}. Paste its text below instead.`);
+    }
   };
 
   return (
@@ -111,8 +144,17 @@ export default function ClaudeManifest() {
               marginBottom: 10,
             }}
           >
-            Drop a text or markdown file here, or paste below.
+            Drop a PDF, text or markdown file here, or paste below.
           </div>
+
+          {readError ? <Note tone="warn">{readError}</Note> : null}
+
+          {docBase64 ? (
+            <Note tone="accent">
+              <strong>{docName}</strong> is queued as a PDF ({Math.round((docBase64.length * 3) / 4 / 1024)} KB).
+              Its text layer is extracted on the server — there is nothing to paste below.
+            </Note>
+          ) : null}
 
           <div className="bx-field">
             <label className="bx-label" htmlFor="doc-name">
@@ -140,7 +182,7 @@ export default function ClaudeManifest() {
           </div>
           <Button
             variant="primary"
-            disabled={!docName.trim() || !docText.trim()}
+            disabled={!docName.trim() || (!docText.trim() && !docBase64)}
             loading={busy === 'ingest_manual_document'}
             onClick={ingest}
           >
@@ -149,9 +191,14 @@ export default function ClaudeManifest() {
 
           {data?.ingested ? (
             <Note tone="ok">
-              Ingested <strong>{data.document?.name}</strong> — {data.chunks} chunk(s), now searchable via{' '}
-              <code>query_knowledge</code>. {data.nextStep}
+              Ingested <strong>{data.document?.name}</strong>
+              {data.pdfPages ? ` — ${data.pdfPages} page(s) of PDF text` : ''} — {data.chunks} chunk(s),
+              now searchable via <code>query_knowledge</code>. {data.nextStep}
             </Note>
+          ) : null}
+
+          {data?.warnings?.length ? (
+            <Note tone="warn">{data.warnings.join(' ')}</Note>
           ) : null}
         </Card>
       ) : null}

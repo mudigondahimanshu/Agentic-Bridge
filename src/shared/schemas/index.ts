@@ -267,6 +267,18 @@ export const KnowledgeFactSchema = z.object({
   evidence: z.array(z.string()).default([]),
   /** Higher = more load-bearing in the generated manifest. */
   weight: z.number().default(1),
+  /**
+   * True when a model inferred this fact rather than a parser extracting it.
+   *
+   * The distinction is load-bearing and deliberately visible: extracted facts
+   * are reproducible and carry an evidence path, reasoned ones are judgment.
+   * The manifest labels them separately so a reviewer can trust the extracted
+   * half without having to audit the whole document.
+   *
+   * Optional rather than defaulted so the many deterministic call sites that
+   * predate it keep constructing facts without naming it; absent reads as false.
+   */
+  reasoned: z.boolean().optional(),
 });
 export type KnowledgeFact = z.infer<typeof KnowledgeFactSchema>;
 

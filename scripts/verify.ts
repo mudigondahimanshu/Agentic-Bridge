@@ -43,10 +43,16 @@ class McpClient {
   private nextId = 1;
   private pending = new Map<number, (value: RpcResponse) => void>();
 
-  constructor() {
+  constructor(env: Record<string, string> = {}) {
     this.child = spawn('npx', ['tsx', 'src/index.ts'], {
       cwd: ROOT,
-      env: { ...process.env, NODE_ENV: 'development', BRIDGE_TRANSPORT: 'stdio', LOG_LEVEL: 'error' },
+      env: {
+        ...process.env,
+        NODE_ENV: 'development',
+        BRIDGE_TRANSPORT: 'stdio',
+        LOG_LEVEL: 'error',
+        ...env,
+      },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 
@@ -97,9 +103,19 @@ class McpClient {
     this.child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method, params })}\n`);
   }
 
-  /** Call a tool and return its structured payload. */
-  async callTool(name: string, args: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
-    const response = await this.request('tools/call', { name, arguments: args });
+  /**
+   * Call a tool and return its structured payload. `meta` lands in the request's
+   * `_meta`, which is where a stdio client presents its credential.
+   */
+  async callTool(
+    name: string,
+    args: Record<string, unknown> = {},
+    meta?: Record<string, unknown>
+  ): Promise<Record<string, unknown>> {
+    const response = await this.request('tools/call', {
+      name,
+      arguments: meta ? { ...args, _meta: meta } : args,
+    });
     if (response.error) throw new Error(`${name}: ${response.error.message}`);
     const result = response.result as
       | { structuredContent?: Record<string, unknown>; content?: { type: string; text?: string }[]; isError?: boolean }
@@ -122,6 +138,190 @@ class McpClient {
 
   close(): void {
     this.child.kill('SIGTERM');
+  }
+}
+
+const API_KEY = 'verify-admin-key';
+const HTTP_PORT = 8991;
+
+/**
+ * The transport-security half of the rehearsal.
+ *
+ * Runs against its own server processes because the properties under test are
+ * boot-time ones: whether BRIDGE_TRANSPORT actually selects HTTP, whether the
+ * 50mb body limit reached the Express parser, and whether a configured
+ * credential is enforced at both entrances (the HTTP edge and the per-tool
+ * guard, which is the only one stdio ever meets).
+ */
+async function verifySecurity(): Promise<void> {
+  /* ------------------- the per-tool guard, over stdio ------------------- */
+  console.log('\n\x1b[1m13. Authorisation (stdio, via the tool guard)\x1b[0m');
+  const guarded = new McpClient({ BRIDGE_ADMIN_API_KEY: API_KEY });
+  try {
+    await guarded.request('initialize', {
+      protocolVersion: '2025-06-18',
+      capabilities: {},
+      clientInfo: { name: 'bridge-verify-auth', version: '1.0.0' },
+    });
+    guarded.notify('notifications/initialized');
+
+    // Reads stay open — an agent that must authenticate to ask a question stops asking.
+    let readable = false;
+    try {
+      await guarded.callTool('list_pipeline_nodes');
+      readable = true;
+    } catch {
+      readable = false;
+    }
+    check('read-only tools remain open when auth is configured', readable);
+
+    let blocked = false;
+    try {
+      await guarded.callTool('reset_bridge', { confirm: false });
+    } catch (error) {
+      blocked = /requires a credential/i.test(String(error));
+    }
+    check('a mutating tool is refused without a credential', blocked);
+
+    let wrongKeyBlocked = false;
+    try {
+      await guarded.callTool('reset_bridge', { confirm: false }, { apiKey: 'not-the-key' });
+    } catch (error) {
+      wrongKeyBlocked = /not recognised/i.test(String(error));
+    }
+    check('a wrong credential is refused', wrongKeyBlocked);
+
+    let allowed = false;
+    try {
+      const result = await guarded.callTool('reset_bridge', { confirm: false }, { apiKey: API_KEY });
+      allowed = result.reset === false; // confirm:false, so it declines to wipe — but it ran
+    } catch {
+      allowed = false;
+    }
+    check('the correct credential is admitted', allowed);
+  } finally {
+    guarded.close();
+  }
+
+  /* ------------------- the HTTP edge and the payload limit ------------------- */
+  console.log('\n\x1b[1m14. Remote surface (HTTP transport)\x1b[0m');
+  const server = spawn('npx', ['tsx', 'src/index.ts'], {
+    cwd: ROOT,
+    env: {
+      ...process.env,
+      NODE_ENV: 'development',
+      BRIDGE_TRANSPORT: 'http',
+      PORT: String(HTTP_PORT),
+      HOST: '127.0.0.1',
+      BRIDGE_ADMIN_API_KEY: API_KEY,
+      LOG_LEVEL: 'error',
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  let banner = '';
+  server.stderr.on('data', (chunk: Buffer) => {
+    banner += chunk.toString();
+  });
+
+  const endpoint = `http://127.0.0.1:${HTTP_PORT}/mcp`;
+  const post = async (body: unknown, headers: Record<string, string> = {}) => {
+    const response = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'application/json, text/event-stream',
+        ...headers,
+      },
+      body: JSON.stringify(body),
+    });
+    return {
+      status: response.status,
+      sessionId: response.headers.get('mcp-session-id'),
+      text: await response.text(),
+    };
+  };
+
+  try {
+    // Wait for the listener rather than sleeping a fixed amount.
+    const deadline = Date.now() + 90_000;
+    let up = false;
+    while (Date.now() < deadline && !up) {
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      try {
+        const health = await fetch(`${endpoint}/health`);
+        up = health.ok;
+      } catch {
+        up = false;
+      }
+    }
+    if (!check('BRIDGE_TRANSPORT=http actually starts an HTTP listener', up, endpoint)) return;
+
+    check(
+      'the 50mb JSON body limit reached the Express parser',
+      /JSON body limit 50mb \(via (express-patch|router-stack)\)/.test(banner),
+      banner.split('\n').find((l) => l.includes('[bridge] Security:'))?.trim() ?? 'no security banner'
+    );
+
+    const call = (name: string, args: Record<string, unknown> = {}) => ({
+      jsonrpc: '2.0',
+      id: 99,
+      method: 'tools/call',
+      params: { name, arguments: args },
+    });
+
+    const anonymous = await post(call('resolve_conflict', { conflict_id: 'x', chosen: 'a' }));
+    check('an unauthenticated mutation is refused at the HTTP edge', anonymous.status === 401,
+      `HTTP ${anonymous.status}`);
+
+    const wrongKey = await post(call('resolve_conflict', { conflict_id: 'x', chosen: 'a' }), {
+      'x-api-key': 'not-the-key',
+    });
+    check('a wrong credential is refused at the HTTP edge', wrongKey.status === 403,
+      `HTTP ${wrongKey.status}`);
+
+    // A full session, to prove the credential also passes the tool guard behind it.
+    const init = await post(
+      {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'initialize',
+        params: {
+          protocolVersion: '2025-06-18',
+          capabilities: {},
+          clientInfo: { name: 'bridge-verify-http', version: '1.0.0' },
+        },
+      },
+      { 'x-api-key': API_KEY }
+    );
+    const session = init.sessionId ?? '';
+    check('an authenticated session initializes', init.status === 200 && !!session);
+    await post({ jsonrpc: '2.0', method: 'notifications/initialized' }, {
+      'x-api-key': API_KEY,
+      'mcp-session-id': session,
+    });
+
+    // ~700 KB: comfortably past body-parser's 100kb default, so a pass here can
+    // only mean the limit was raised.
+    const large = 'Aurora architecture decision record paragraph. '.repeat(15_000);
+    const bulk = await post(
+      call('ingest_manual_document', { name: 'Bulk payload probe', text: large }),
+      { 'x-api-key': API_KEY, 'mcp-session-id': session }
+    );
+    check(
+      'a payload far past the 100kb default is accepted',
+      bulk.status === 200 && bulk.text.includes('"ingested"'),
+      `${Math.round(large.length / 1024)} KB → HTTP ${bulk.status}`
+    );
+
+    // The health endpoint stays open so a load balancer can reach it.
+    const health = await fetch(`${endpoint}/health`);
+    check('the health endpoint stays reachable without a credential', health.ok,
+      `HTTP ${health.status}`);
+  } catch (error) {
+    check(`remote surface checks (${error instanceof Error ? error.message : String(error)})`, false);
+  } finally {
+    server.kill('SIGTERM');
   }
 }
 
@@ -364,8 +564,69 @@ return { callSites: hits.length, tables, files: [...new Set(hits.map(h => h.path
       pipeline_name: 'Aurora feature SDLC',
     });
     check('pipeline executed', (ran.completed as number) === 4, `${ran.completed} stages`);
-    check('side-effecting stages planned, not performed', (ran.planned as number) >= 1,
+    check('side-effecting stages planned, not performed by default', (ran.planned as number) >= 1,
       `${ran.executed} executed / ${ran.planned} planned`);
+    check('plan mode is reported as such', ran.sideEffectsMode === 'planned');
+
+    /* --------------------- side effects, performed for real --------------------- */
+    console.log('\n\x1b[1m8b. Side effects executed for real\x1b[0m');
+
+    await client.callTool('save_pipeline', {
+      name: 'Side-effect probe',
+      description: 'Exercises the real execution path',
+      nodes: [
+        // A command with no dependencies, so the check measures the executor
+        // rather than whether a fixture's devDependencies happen to be installed.
+        { id: 's1', type: 'run_tests', requiresApproval: false, config: { test_command: 'node --version' } },
+        { id: 's2', type: 'push', requiresApproval: false, config: {} },
+        { id: 's3', type: 'send_slack_message', requiresApproval: false, config: {} },
+      ],
+      edges: [],
+    });
+
+    const realRun = await client.callTool('run_pipeline', {
+      // Carries a ticket key, so the push stage clears the commit-convention gate
+      // and is stopped by the branch-protection gate instead — which is the one
+      // being verified here.
+      task: 'Guard against null ISSUED_ON in the date window [AUR-4480]',
+      pipeline_name: 'Side-effect probe',
+      execute_side_effects: true,
+    });
+    check('execute mode is reported as such', realRun.sideEffectsMode === 'executed');
+
+    const stages = realRun.results as { id: string; executed: boolean; output: string; status: string }[];
+    const tests = stages.find((s) => s.id === 's1');
+    check(
+      'run_tests really ran the command',
+      tests?.executed === true && /PASSED/.test(tests.output ?? ''),
+      tests?.output?.split('\n').find((l) => l.startsWith('PASSED') || l.startsWith('FAILED')) ?? 'no result line'
+    );
+    check(
+      'the command output was captured',
+      /v\d+\.\d+\.\d+/.test(tests?.output ?? ''),
+      'node --version echoed back'
+    );
+
+    const push = stages.find((s) => s.id === 's2');
+    check(
+      'push refuses a protected branch even in execute mode',
+      push?.executed === false && /protected branch/i.test(push.output ?? ''),
+      'branch protection held'
+    );
+
+    const slack = stages.find((s) => s.id === 's3');
+    check(
+      'unconfigured integrations name the variable that enables them',
+      push !== undefined && /SLACK_WEBHOOK_URL/.test(slack?.output ?? '')
+    );
+    check(
+      'configured integrations are reported',
+      typeof (realRun.integrations as Record<string, boolean>)?.slack === 'boolean',
+      Object.entries(realRun.integrations as Record<string, boolean>)
+        .filter(([, on]) => on)
+        .map(([name]) => name)
+        .join(', ') || 'none wired in this environment'
+    );
 
     /* ------------------------------- knowledge ------------------------------- */
     console.log('\n\x1b[1m9. Knowledge base + manifest\x1b[0m');
@@ -431,6 +692,58 @@ return { callSites: hits.length, tables, files: [...new Set(hits.map(h => h.path
       const contents = (read.result as { contents?: { text?: string }[] })?.contents;
       check(`read ${uri}`, !!contents?.[0]?.text, `${contents?.[0]?.text?.length ?? 0} chars`);
     }
+
+    /* ------------------------------ PDF ingestion ------------------------------ */
+    // Runs after the manifest checks on purpose: ingesting a fifteen-page design
+    // document would otherwise dominate the CLAUDE.md the demo shows.
+    console.log('\n\x1b[1m12. PDF ingestion\x1b[0m');
+    const pdfPath = path.join(ROOT, 'idea.pdf');
+    if (fs.existsSync(pdfPath)) {
+      const fromPath = await client.callTool('ingest_manual_document', {
+        name: 'Architecture blueprint (PDF)',
+        file_path: pdfPath,
+      });
+      check('PDF ingested from a file path', fromPath.ingested === true,
+        `${fromPath.pdfPages} pages → ${fromPath.chunks} chunks`);
+      check('the text layer was actually extracted', (fromPath.chunks as number) > 5,
+        `${(fromPath.document as { chars: number })?.chars} characters of text`);
+      check('the document is recognised as a PDF',
+        (fromPath.document as { mimeType?: string })?.mimeType === 'application/pdf');
+
+      const pdfSearch = await client.callTool('query_knowledge', {
+        query: 'pre-computation swarm reconnaissance personas',
+        limit: 5,
+      });
+      const hits = pdfSearch.results as { title: string }[];
+      check('PDF content is searchable in the knowledge base',
+        hits.some((h) => /Architecture blueprint/i.test(h.title)),
+        `${hits.length} hits`);
+    } else {
+      check('PDF ingestion (idea.pdf not present — skipped)', true);
+    }
+
+    const tasksPdf = path.join(ROOT, 'tasks.pdf');
+    if (fs.existsSync(tasksPdf)) {
+      // The dashboard dropzone path: bytes, not a server-side path.
+      const fromUpload = await client.callTool('ingest_manual_document', {
+        name: 'Task list (uploaded)',
+        file_base64: fs.readFileSync(tasksPdf).toString('base64'),
+      });
+      check('PDF ingested from a base64 upload', fromUpload.ingested === true,
+        `${fromUpload.pdfPages} pages → ${fromUpload.chunks} chunks`);
+    }
+
+    // A binary format with no extractor must say so rather than embed noise.
+    let binaryRejected = false;
+    try {
+      await client.callTool('ingest_manual_document', {
+        name: 'A PNG, which is not a document',
+        file_base64: fs.readFileSync(path.join(ROOT, 'logo.png')).toString('base64'),
+      });
+    } catch (error) {
+      binaryRejected = /binary file/i.test(String(error));
+    }
+    check('an unsupported binary upload is rejected with a reason', binaryRejected);
   } catch (error) {
     failed++;
     failures.push(`fatal: ${error instanceof Error ? error.message : String(error)}`);
@@ -438,6 +751,8 @@ return { callSites: hits.length, tables, files: [...new Set(hits.map(h => h.path
   } finally {
     client.close();
   }
+
+  await verifySecurity();
 
   console.log(`\n${'─'.repeat(66)}`);
   if (failed === 0) {

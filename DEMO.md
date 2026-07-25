@@ -8,7 +8,7 @@ every claim in it.
 ```bash
 cd agentic-bridge
 npm install                        # installs + builds widgets automatically
-npx tsx scripts/verify.ts          # 65/65 — also resets state to a clean slate
+npx tsx scripts/verify.ts          # 89/89 — also resets state to a clean slate
 ```
 
 Then in NitroStudio: **Add Server → Nitro Project → this folder → Open Project → Studio App Canvas.**
@@ -144,6 +144,28 @@ Open the **Pipeline Builder** widget briefly, then land the point:
 > Run state commits to disk after every agent, atomically. Restart and `get_swarm_run` shows
 > exactly where it was. Generated skills rehydrate on boot. That is what we used instead of
 > Restate — same guarantee, one process.
+
+**"The pipeline stages don't really do anything, do they?"**
+> They do. `run_pipeline` takes `execute_side_effects: true`, and then `run_tests` spawns the
+> project's own test command and captures the output, `push` runs git, `deploy` dispatches a
+> GitHub Actions workflow or a Jenkins job, `update_jira` calls Jira REST v3 to transition the
+> ticket and comment, and `send_slack_message` posts to a webhook. The default is plan-only
+> because a bridge that force-pushes the first time someone clicks Run is not a feature — and
+> even in execute mode `push` refuses a protected branch and refuses a commit message that
+> fails the convention the swarm recovered from `commitlint.config.js`.
+
+**"What stops anyone hitting the deployed server and overruling a conflict?"**
+> Set `BRIDGE_ADMIN_API_KEY` and the nine state-mutating tools require a credential — refused
+> 401 without one, 403 with a wrong one — while read-only tools stay open so agents can still
+> ask questions. It's enforced twice against one list: an Express edge in front of `/mcp`, and
+> a guard on the tools themselves, because stdio never touches Express. JWT works too, HS256
+> through HS512, verified on `node:crypto`.
+
+**"Can I give it the architecture PDF nobody ever checked in?"**
+> Drop it on the manifest widget. `ingest_manual_document` parses the PDF text layer —
+> FlateDecode, object streams, per-font ToUnicode CMaps — chunks it into the same vector space
+> as everything else, and it's searchable immediately and in the next manifest. The spec PDF
+> for this project ingests as 15 pages and 53 chunks.
 
 **"You didn't build the Next.js dashboard from the spec."**
 > Correct, and on purpose. NitroStack widgets *are* Next.js React, and the Widget SDK's

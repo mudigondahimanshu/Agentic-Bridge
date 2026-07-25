@@ -1,5 +1,6 @@
 import { McpApp, Module, ConfigModule } from '@nitrostack/core';
 
+import { resolveTransportType } from './shared/transport.js';
 import { SharedModule } from './shared/shared.module.js';
 import { CodebaseModule } from './modules/codebase/codebase.module.js';
 import { DocumentationModule } from './modules/documentation/documentation.module.js';
@@ -17,6 +18,7 @@ import {
   SystemHealthCheck,
   FixtureHealthCheck,
   KnowledgeHealthCheck,
+  SecurityHealthCheck,
 } from './health/system.health.js';
 
 /**
@@ -28,11 +30,17 @@ import {
  *
  * Transport: STDIO by default — that is what NitroStudio spawns. Switches to
  * HTTP when NODE_ENV=production or BRIDGE_TRANSPORT=http, which is what
- * NitroCloud runs and what the ChatGPT connector needs.
+ * NitroCloud runs, what the ChatGPT connector needs, and what the admin
+ * dashboard talks to over HTTP/SSE.
+ *
+ * The block below is declarative documentation of that intent, but it is not
+ * what NitroStack 1.0.x actually reads: `NitroStackServer.start()` selects the
+ * transport from MCP_TRANSPORT_TYPE / NODE_ENV and takes the port and host from
+ * PORT / HOST, ignoring `@McpApp.transport` entirely. `resolveTransport()` in
+ * index.ts translates BRIDGE_TRANSPORT into the variables the framework honours,
+ * before start(). Keep the two in step if either side changes.
  */
-const transportType =
-  (process.env.BRIDGE_TRANSPORT as 'stdio' | 'http' | 'dual' | undefined) ??
-  (process.env.NODE_ENV === 'production' ? 'http' : 'stdio');
+const transportType = resolveTransportType();
 
 @McpApp({
   module: AppModule,
@@ -75,6 +83,6 @@ const transportType =
     SwarmModule,
     BridgeModule,
   ],
-  providers: [SystemHealthCheck, FixtureHealthCheck, KnowledgeHealthCheck],
+  providers: [SystemHealthCheck, FixtureHealthCheck, KnowledgeHealthCheck, SecurityHealthCheck],
 })
 export class AppModule {}

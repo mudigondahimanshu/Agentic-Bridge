@@ -1,14 +1,19 @@
-import { Injectable, ToolDecorator as Tool, Widget, ExecutionContext, z } from '@nitrostack/core';
+import { Injectable, ToolDecorator as Tool, Widget, ExecutionContext, z, UseGuards } from '@nitrostack/core';
+import { AdminGuard } from '../../shared/security/admin.guard.js';
 import { PipelineService, NODE_CATALOG } from './pipeline.service.js';
+import { EffectsService } from './effects.service.js';
 import { StoreService } from '../../shared/services/store.service.js';
+import { WorkspaceService } from '../../shared/services/workspace.service.js';
 import { PipelineGraphSchema, PIPELINE_NODE_TYPES } from '../../shared/schemas/index.js';
 import type { PipelineGraph } from '../../shared/schemas/index.js';
 
-@Injectable({ deps: [PipelineService, StoreService] })
+@Injectable({ deps: [PipelineService, StoreService, EffectsService, WorkspaceService] })
 export class PipelineTools {
   constructor(
     private pipeline: PipelineService,
-    private store: StoreService
+    private store: StoreService,
+    private effects: EffectsService,
+    private workspace: WorkspaceService
   ) {}
 
   @Tool({
@@ -59,6 +64,7 @@ export class PipelineTools {
     },
   })
   @Widget('pipeline-builder')
+  @UseGuards(AdminGuard)
   async savePipeline(input: PipelineGraph, ctx: ExecutionContext) {
     const order = this.pipeline.validateAndOrder(input);
     this.store.savePipeline(input);
@@ -101,13 +107,30 @@ export class PipelineTools {
     title: 'Run a pipeline',
     description:
       'Executes a saved pipeline against a feature request. Cognitive stages (understand, ' +
-      'think, explore, design) genuinely query the knowledge base and return grounded output. ' +
-      'Side-effecting stages (run_tests, push, deploy, update_jira, send_slack_message) are ' +
-      'PLANNED not performed — each reports the exact command it would issue, derived from the ' +
-      "DevOps Navigator's findings, and is flagged executed:false. Supports MCP task progress.",
+      'think, explore, design, develop, write_tests) query the knowledge base and return ' +
+      'grounded output on every run. Side-effecting stages (run_tests, push, deploy, ' +
+      'update_jira, send_slack_message) are PLANNED by default and report the exact command ' +
+      'or API call they would issue. Pass execute_side_effects=true to perform them for real: ' +
+      "the test command runs, git commits and pushes, CI is dispatched, the Jira ticket moves " +
+      'and Slack is notified — for whichever integrations are configured. Supports MCP task ' +
+      'progress.',
     inputSchema: z.object({
       task: z.string().min(3).describe('The feature request to run through the pipeline'),
       pipeline_name: z.string().optional().describe('Which saved pipeline to run. Omit for the most recent.'),
+      execute_side_effects: z
+        .boolean()
+        .default(false)
+        .describe(
+          'Perform side effects for real instead of planning them. Runs the test command, ' +
+            'commits and pushes, dispatches CI, transitions the Jira ticket and posts to Slack. ' +
+            'Only the integrations that are actually configured will fire.'
+        ),
+      target: z
+        .string()
+        .optional()
+        .describe(
+          'Repository the side-effecting stages act on. Defaults to the bundled legacy fixture.'
+        ),
     }),
     taskSupport: 'optional',
     examples: {
@@ -116,12 +139,17 @@ export class PipelineTools {
         pipeline: 'Aurora feature SDLC',
         executed: 4,
         planned: 3,
+        sideEffectsMode: 'planned',
         results: [{ id: 'n1', type: 'understand', status: 'ok', executed: true }],
       },
     },
   })
   @Widget('pipeline-builder')
-  async runPipeline(input: { task: string; pipeline_name?: string }, ctx: ExecutionContext) {
+  @UseGuards(AdminGuard)
+  async runPipeline(
+    input: { task: string; pipeline_name?: string; execute_side_effects?: boolean; target?: string },
+    ctx: ExecutionContext
+  ) {
     const pipeline = this.store.getPipeline(input.pipeline_name);
     if (!pipeline) {
       throw new Error(
@@ -130,6 +158,11 @@ export class PipelineTools {
           : 'No pipeline has been saved yet. Compose one in the pipeline-builder widget or call save_pipeline.'
       );
     }
+
+    const executeSideEffects = input.execute_side_effects === true;
+    // Resolved through the workspace allow-list even in plan mode, so a bad
+    // target fails immediately rather than at the first stage that touches disk.
+    const target = this.workspace.resolveTarget(input.target);
 
     const order = this.pipeline.validateAndOrder(pipeline);
     const byId = new Map(pipeline.nodes.map((n) => [n.id, n]));
@@ -140,7 +173,10 @@ export class PipelineTools {
       ctx.task?.throwIfCancelled();
       ctx.task?.updateProgress(`[${index + 1}/${order.length}] ${node.label ?? node.type}`);
 
-      const result = this.pipeline.executeNode(node, input.task);
+      const result = await this.pipeline.executeNode(node, input.task, {
+        executeSideEffects,
+        target,
+      });
       results.push(result);
 
       if (result.status === 'paused') {
@@ -148,25 +184,43 @@ export class PipelineTools {
         ctx.logger.info('Pipeline paused for approval', { node: id });
         break;
       }
+      // A real side effect that failed stops the line. Continuing past a red
+      // test suite to push and deploy is precisely the behaviour an SDLC exists
+      // to prevent.
+      if (result.status === 'failed' && executeSideEffects) {
+        ctx.logger.warn('Pipeline halted on a failed stage', { node: id, error: result.error });
+        break;
+      }
     }
 
     ctx.logger.info('Pipeline run complete', {
       pipeline: pipeline.name,
       stages: results.length,
+      sideEffects: executeSideEffects,
     });
+
+    const failed = results.find((r) => r.status === 'failed');
 
     return {
       pipeline: pipeline.name,
       task: input.task,
+      target: this.workspace.rel(this.workspace.projectRoot, target) || target,
       stageCount: order.length,
       completed: results.length,
       executed: results.filter((r) => r.executed).length,
       planned: results.filter((r) => !r.executed).length,
       pausedAt: results.find((r) => r.status === 'paused')?.id,
+      failedAt: failed?.id,
+      sideEffectsMode: executeSideEffects ? 'executed' : 'planned',
+      integrations: this.effects.describeConfiguration(),
       results,
-      note:
-        'Stages with executed:false were planned but not performed. The bridge never writes to, ' +
-        'runs commands in, or sends messages about a target repository on its own initiative.',
+      note: executeSideEffects
+        ? 'Side effects were performed for real against the configured integrations. Stages ' +
+          'still showing executed:false had no integration configured — the result says which ' +
+          'variable enables each one.'
+        : 'Stages with executed:false were planned, not performed. Pass execute_side_effects=true ' +
+          'to run the test command, commit and push, dispatch CI, move the Jira ticket and post ' +
+          'to Slack for real.',
       nodes: NODE_CATALOG,
       savedPipelines: this.store.all('pipelines').map((p) => ({ name: p.name, stages: p.nodes.length })),
     };

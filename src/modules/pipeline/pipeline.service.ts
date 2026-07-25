@@ -4,17 +4,25 @@
  * The administrator composes an SDLC as a node graph in the pipeline-builder
  * widget; this service validates and executes it.
  *
- * Honesty about what executes: the cognitive nodes (understand, think, explore,
- * design) genuinely query the knowledge base and return real, grounded output.
- * The side-effecting nodes (push, deploy, update_jira, send_slack_message) are
- * PLANNED, not performed — each returns the exact command or API call it would
- * issue, derived from what the DevOps Navigator actually found in the repo.
- * A bridge that force-pushes to a stranger's master branch during a demo is not
- * a feature. Every such node is flagged `executed: false` in the result.
+ * The cognitive nodes (understand, think, explore, design, develop, write_tests)
+ * query the knowledge base and return grounded output on every run. The
+ * side-effecting nodes (run_tests, push, deploy, update_jira,
+ * send_slack_message) are real — `EffectsService` shells out to git, runs the
+ * project's test command, dispatches CI, calls Jira REST and posts to Slack —
+ * but they only fire when the caller passes `execute_side_effects: true` AND the
+ * relevant integration is configured.
+ *
+ * The default is plan-only, and that default is load-bearing: a bridge that
+ * force-pushes to a stranger's master branch the first time someone clicks Run
+ * is not a feature. In plan mode each stage reports the exact command or API
+ * call it would issue and is flagged `executed: false`, so the plan is a dry run
+ * of the same code path rather than a separate story about it.
  */
 import { Injectable } from '@nitrostack/core';
 import { StoreService } from '../../shared/services/store.service.js';
 import { SemanticService } from '../../shared/services/semantic.service.js';
+import { EffectsService } from './effects.service.js';
+import type { EffectContext, EffectOutcome } from './effects.service.js';
 import type { PipelineGraph, PipelineNodeType } from '../../shared/schemas/index.js';
 
 export interface NodeDescriptor {
@@ -121,17 +129,27 @@ export interface NodeResult {
   id: string;
   type: PipelineNodeType;
   label: string;
-  status: 'ok' | 'planned' | 'paused' | 'skipped';
+  status: 'ok' | 'planned' | 'paused' | 'skipped' | 'failed';
   executed: boolean;
   output: string;
   evidence: string[];
+  /** Set when a side effect was attempted and the integration reported a problem. */
+  error?: string;
 }
 
-@Injectable({ deps: [StoreService, SemanticService] })
+export interface ExecuteOptions {
+  /** Perform side effects for real instead of planning them. */
+  executeSideEffects: boolean;
+  /** Repository the side-effecting stages act on. */
+  target: string;
+}
+
+@Injectable({ deps: [StoreService, SemanticService, EffectsService] })
 export class PipelineService {
   constructor(
     private store: StoreService,
-    private semantic: SemanticService
+    private semantic: SemanticService,
+    private effects: EffectsService
   ) {}
 
   descriptor(type: PipelineNodeType): NodeDescriptor {
@@ -182,14 +200,22 @@ export class PipelineService {
     return order;
   }
 
-  /** Execute one node against the knowledge base. */
-  executeNode(
-    node: { id: string; type: PipelineNodeType; label?: string; requiresApproval?: boolean },
-    task: string
-  ): NodeResult {
+  /** Execute one node against the knowledge base, and against the world if asked. */
+  async executeNode(
+    node: {
+      id: string;
+      type: PipelineNodeType;
+      label?: string;
+      requiresApproval?: boolean;
+      config?: Record<string, string>;
+    },
+    task: string,
+    options: ExecuteOptions
+  ): Promise<NodeResult> {
     const desc = this.descriptor(node.type);
     const label = node.label ?? desc.label;
     const base = { id: node.id, type: node.type, label };
+    const effectCtx: EffectContext = { target: options.target, task, config: node.config ?? {} };
 
     switch (node.type) {
       case 'understand': {
@@ -282,78 +308,131 @@ export class PipelineService {
 
       case 'run_tests': {
         const frameworks = this.store.factsByCategory('testing').find((t) => t.id === 'qa:frameworks');
-        return {
-          ...base,
-          status: 'planned',
-          executed: false,
-          output:
-            'Would run the project test command in the target repository. ' +
-            (frameworks ? `Detected runners:\n${frameworks.detail}` : 'No test runner detected.') +
-            '\nNot executed: the bridge does not run commands in a codebase it only has read access to.',
-          evidence: frameworks ? frameworks.evidence : [],
-        };
+        const plan =
+          'Would run the project test command in the target repository. ' +
+          (frameworks ? `Detected runners:\n${frameworks.detail}` : 'No test runner detected.');
+        if (!options.executeSideEffects) {
+          return this.planned(base, plan, frameworks ? frameworks.evidence : []);
+        }
+        return this.performed(base, await this.effects.runTests(effectCtx), plan);
       }
 
       case 'push': {
         const convention = this.store.factsByCategory('cicd').find((f) => f.id === 'cicd:commit-convention');
         const branches = this.store.factsByCategory('cicd').find((f) => f.id === 'cicd:branch-model');
-        return {
-          ...base,
-          status: 'planned',
-          executed: false,
-          output:
-            'Would stage, commit and push. Commit must satisfy:\n' +
-            (convention?.detail ?? '  no commit convention detected') +
-            (branches ? `\nBranch model: ${branches.detail}` : '') +
-            '\nNot executed: no write operations are performed against the target repository.',
-          evidence: convention ? convention.evidence : [],
-        };
+        const commitMessage = node.config?.commit_message ?? this.suggestCommitMessage(task);
+        const plan =
+          'Would stage, commit and push. Commit must satisfy:\n' +
+          (convention?.detail ?? '  no commit convention detected') +
+          (branches ? `\nBranch model: ${branches.detail}` : '') +
+          `\nCommit message: ${commitMessage}`;
+        if (!options.executeSideEffects) {
+          return this.planned(base, plan, convention ? convention.evidence : []);
+        }
+        // The convention the DevOps Navigator recovered is enforced before the
+        // commit rather than discovered afterwards by a CI rejection.
+        return this.performed(
+          base,
+          await this.effects.push(effectCtx, {
+            commitMessage,
+            requiresTicketRef: !!convention?.detail.includes('ticket key is MANDATORY'),
+          }),
+          plan
+        );
       }
 
       case 'deploy': {
         const pipelines = this.store.factsByCategory('cicd').filter((f) => f.id.startsWith('cicd:pipeline:'));
         const gates = this.store.factsByCategory('cicd').find((f) => f.id === 'cicd:approval-gates');
-        return {
-          ...base,
-          status: 'planned',
-          executed: false,
-          output:
-            'Would trigger the mapped deployment path:\n' +
-            (pipelines.length ? pipelines.map((p) => `  • ${p.title}: ${p.detail}`).join('\n') : '  none detected') +
-            (gates ? `\nApproval required: ${gates.detail}` : '') +
-            '\nNot executed.',
-          evidence: pipelines.flatMap((p) => p.evidence),
-        };
+        const plan =
+          'Would trigger the mapped deployment path:\n' +
+          (pipelines.length ? pipelines.map((p) => `  • ${p.title}: ${p.detail}`).join('\n') : '  none detected') +
+          (gates ? `\nApproval required: ${gates.detail}` : '');
+        if (!options.executeSideEffects) {
+          return this.planned(base, plan, pipelines.flatMap((p) => p.evidence));
+        }
+        return this.performed(base, await this.effects.deploy(effectCtx), plan);
       }
 
       case 'update_jira': {
         const issues = this.store.factsByCategory('agile').filter((f) => f.id.startsWith('agile:issue:'));
-        return {
-          ...base,
-          status: 'planned',
-          executed: false,
-          output:
-            `Would transition the ticket and append a development summary. ` +
-            `${issues.length} open issue(s) are candidates:\n` +
-            issues.slice(0, 5).map((i) => `  • ${i.title}`).join('\n') +
-            '\nNot executed: the Jira integration is backed by a local fixture in this build.',
-          evidence: issues.map((i) => i.id).slice(0, 5),
-        };
+        const plan =
+          `Would transition the ticket and append a development summary. ` +
+          `${issues.length} open issue(s) are candidates:\n` +
+          issues.slice(0, 5).map((i) => `  • ${i.title}`).join('\n');
+        if (!options.executeSideEffects) {
+          return this.planned(base, plan, issues.map((i) => i.id).slice(0, 5));
+        }
+        const summary =
+          `Automated update from the Enterprise Agentic Bridge.\n\n` +
+          `Task: ${task}\n` +
+          `Pipeline stage: ${label}`;
+        return this.performed(base, await this.effects.updateJira(effectCtx, summary), plan);
       }
 
       case 'send_slack_message': {
-        return {
-          ...base,
-          status: 'planned',
-          executed: false,
-          output:
-            `Would post a summary of "${task}" to the team channel and mention reviewers. ` +
-            'Not executed: no outbound webhook is configured, and the bridge does not send ' +
-            'messages on your behalf without an explicit channel and token.',
-          evidence: [],
-        };
+        const plan = `Would post a summary of "${task}" to the team channel and mention reviewers.`;
+        if (!options.executeSideEffects) return this.planned(base, plan, []);
+        const text =
+          `*Enterprise Agentic Bridge* completed a pipeline run.\n` +
+          `> ${task}\n` +
+          `Stage: ${label}`;
+        return this.performed(base, await this.effects.sendSlackMessage(effectCtx, text), plan);
       }
     }
+  }
+
+  /** A side effect that was deliberately not performed. */
+  private planned(
+    base: { id: string; type: PipelineNodeType; label: string },
+    plan: string,
+    evidence: string[]
+  ): NodeResult {
+    return {
+      ...base,
+      status: 'planned',
+      executed: false,
+      output:
+        `${plan}\nNot executed — pass execute_side_effects=true on run_pipeline to perform this ` +
+        `for real.`,
+      evidence,
+    };
+  }
+
+  /**
+   * A side effect that was attempted. The plan is retained above the outcome so
+   * the result still shows what the stage set out to do, whether or not the
+   * integration was reachable.
+   */
+  private performed(
+    base: { id: string; type: PipelineNodeType; label: string },
+    outcome: EffectOutcome,
+    plan: string
+  ): NodeResult {
+    return {
+      ...base,
+      status: outcome.executed ? (outcome.error ? 'failed' : 'ok') : 'planned',
+      executed: outcome.executed,
+      output: `${plan}\n\n${outcome.output}`,
+      evidence: outcome.evidence,
+      ...(outcome.error ? { error: outcome.error } : {}),
+    };
+  }
+
+  /**
+   * Build a commit subject in the shape this project's fixture mandates:
+   * `<type>(<scope>): <subject>   [TICKET-KEY]`. Only used when the push node
+   * carries no explicit `commit_message`.
+   */
+  private suggestCommitMessage(task: string): string {
+    const ticket = task.match(/\b[A-Z][A-Z0-9]+-\d+\b/)?.[0];
+    const subject = task
+      .replace(/\b[A-Z][A-Z0-9]+-\d+\b/g, '')
+      .trim()
+      .replace(/\s+/g, ' ')
+      .toLowerCase()
+      .slice(0, 60);
+    return `feat: ${subject}${ticket ? `   [${ticket}]` : ''}`;
   }
 
   /** Rank knowledge facts against a free-text query. */

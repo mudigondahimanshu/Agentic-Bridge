@@ -58,8 +58,10 @@ npm run verify
 > If either safety net is bypassed (`npm install --ignore-scripts`), run `npm run setup`.
 
 `npm run verify` spawns the real MCP server over STDIO and drives the entire demo path with
-live JSON-RPC — 65 assertions covering every claim in this README. If it prints
-`ALL 65 CHECKS PASSED`, the demo works.
+live JSON-RPC — 89 assertions covering every claim in this README. It also boots a second
+server on the HTTP transport to prove the 50 MB body limit reached the Express parser and that
+an unauthenticated mutation is refused at the socket. If it prints `ALL 89 CHECKS PASSED`, the
+demo works.
 
 ### In NitroStudio
 
@@ -114,7 +116,7 @@ second server to deploy and nothing to keep in sync.
 | `architecture-map` | layer distribution, blast-radius meters, change-surface tracer |
 | `design-system` | palette swatches, type stack, component inventory, violations |
 | `skill-forge` | mint a tool and watch it register live |
-| `claude-manifest` | the generated artifact + document dropzone |
+| `claude-manifest` | the generated artifact + PDF/text document dropzone |
 
 ---
 
@@ -171,10 +173,15 @@ These are things a reviewer would find, so they are stated up front.
 - **Jira and Teams are local fixtures**, not live OAuth — `data/mock-jira-sprint.json` and
   `data/mock-teams-transcript.txt`. The *shape* is the real integration shape: swap
   `AgileService.loadSprint()` for a Jira REST call and nothing downstream changes.
-- **Side-effecting pipeline stages are planned, not performed.** `push`, `deploy`,
-  `update_jira` and `send_slack_message` return the exact command they would issue — derived
-  from what the DevOps Navigator actually found — and are flagged `executed: false`. A bridge
-  that force-pushes to a stranger's branch during a demo is not a feature.
+- **Side-effecting pipeline stages are real, but gated twice.** `run_tests`, `push`, `deploy`,
+  `update_jira` and `send_slack_message` genuinely run the test command, commit and push,
+  dispatch a GitHub Actions workflow or Jenkins job, call Jira REST v3 and post to a Slack
+  webhook — but only when `run_pipeline` is called with `execute_side_effects: true` *and* the
+  integration is configured. The default is plan-only: each stage reports the exact command it
+  would issue, derived from what the DevOps Navigator found, flagged `executed: false`. A bridge
+  that force-pushes to a stranger's branch the first time someone clicks Run is not a feature.
+  `push` additionally refuses protected branches and commit messages that fail the convention
+  the swarm recovered.
 - **Skill bodies execute in-process** via `new AsyncFunction`. That is not a security sandbox
   and is not presented as one. A deny-list rejects `require`, `import`, `process`, `eval`,
   `child_process`, `globalThis`, `fetch` and `__dirname` before compilation; the body gets no
@@ -182,15 +189,39 @@ These are things a reviewer would find, so they are stated up front.
   `BRIDGE_ALLOW_SKILL_GENERATION=false` disables the path. Right threat model: a developer
   running this against their own codebase. Wrong threat model: accepting skill bodies from
   untrusted third parties.
-- **`jsonBodyLimit` does not exist in NitroStack v1.0.14.** The architecture spec cites it, but
-  it is [issue #4](https://github.com/nitrocloudofficial/nitrostack/issues/4) — an open feature
-  request, not a shipped option. Payload safety is instead enforced upstream in
+- **`jsonBodyLimit` does not exist in NitroStack v1.0.14**, so the bridge installs it itself.
+  The spec cites the option, but upstream it is still
+  [issue #4](https://github.com/nitrocloudofficial/nitrostack/issues/4) and the transport calls a
+  bare `express.json()` — body-parser's 100 kB default, two orders of magnitude below what
+  `ingest_manual_document` is built for.
+  [`HttpHardeningService`](src/shared/services/http-hardening.service.ts) decorates `express.json`
+  on the exact express instance the transport imports, before the transport is constructed, and
+  falls back to swapping the parser out of the router stack if that resolution ever changes.
+  Configurable with `BRIDGE_JSON_BODY_LIMIT`; the startup banner reports the limit and how it was
+  applied. Traversal safety is separate and unchanged, in
   [`WorkspaceService`](src/shared/services/workspace.service.ts): a root allow-list, a 4,000-file
   cap, a 2 MB per-file cap and a 64 MB traversal budget, with symlinks resolved before the
   containment check.
+- **`@McpApp.transport` is accepted and ignored by NitroStack v1.0.14.** It selects the transport
+  from `MCP_TRANSPORT_TYPE` / `NODE_ENV` and the listen address from `PORT` / `HOST`, so
+  `BRIDGE_TRANSPORT=http` did nothing until [`shared/transport.ts`](src/shared/transport.ts)
+  started translating it at boot. The decorator block is kept as documentation of intent and the
+  two are derived from one function.
 - **Restate is not used.** The value it would provide here — a long run and a human pause that
   both survive a restart — comes from MCP Tasks (`taskSupport: 'optional'`, `ctx.task`) plus an
   atomic-write JSON store that commits after every agent. One process instead of three.
+- **The Vercel AI SDK is not used, and the swarm makes no LLM calls.** The architecture spec
+  routes the seven personas through `experimental_createMCPClient`; here they are deterministic
+  parsers, and the orchestrator is editorial rather than generative. That is a deliberate trade:
+  it buys byte-identical output for the same repository, an evidence path on every claim, no API
+  key, no rate limit and no hallucinated coverage threshold — and it costs the ability to
+  summarise in prose. `ANTHROPIC_API_KEY` layers narrative enrichment on top if you want it; the
+  manifest is complete without it.
+- **The pipeline builder is an ordered chain, not a free-form React Flow canvas.** The backend
+  executes a topologically sorted graph, an ordered chain is the shape that maps onto it, and it
+  stays usable inside a narrow widget iframe where canvas drag-and-drop does not. Saving still
+  serialises to the same node/edge JSON schema, and cycles are rejected by Kahn's algorithm
+  server-side.
 - The framework logs a `Cannot resolve token "OAUTH_CONFIG"` error on boot. That is NitroStack
   core instantiating its optional OAuth module; it is harmless and unrelated to this project.
 
@@ -203,11 +234,44 @@ Everything has a working default. Nothing is required.
 | Variable | Default | Purpose |
 |---|---|---|
 | `BRIDGE_TRANSPORT` | `stdio` (`http` in production) | Transport mode |
-| `PORT` | `8080` | HTTP port |
+| `PORT` / `HOST` | `8080` / `0.0.0.0` | HTTP listen address |
+| `BRIDGE_ADMIN_API_KEY` | unset | Enables auth. One key or a comma-separated list; `label:secret` accepted |
+| `BRIDGE_JWT_SECRET` | unset | Enables HS256/384/512 bearer tokens (`BRIDGE_JWT_ISSUER` / `_AUDIENCE` optional) |
+| `BRIDGE_AUTH_SCOPE` | `mutations` | `all` requires a credential for reads too |
+| `BRIDGE_JSON_BODY_LIMIT` | `50mb` | Max JSON request body on the HTTP transport |
 | `BRIDGE_ALLOWED_ROOTS` | project + fixture | `:`-separated extra roots the swarm may read |
 | `BRIDGE_ALLOW_SKILL_GENERATION` | `true` | Set `false` to disable runtime skill minting |
 | `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
 | `ANTHROPIC_API_KEY` | unset | Optional; enables narrative enrichment |
+
+Side-effecting pipeline stages are configured separately — `BRIDGE_TEST_COMMAND`,
+`BRIDGE_GIT_REMOTE` / `_BRANCH` / `_ALLOW_PROTECTED`, `GITHUB_TOKEN` + `GITHUB_REPOSITORY`,
+`JENKINS_URL` + `JENKINS_JOB` + credentials, `JIRA_BASE_URL` + `JIRA_EMAIL` + `JIRA_API_TOKEN`,
+and `SLACK_WEBHOOK_URL`. See [`.env.example`](.env.example) for the full set.
+
+### Securing the remote surface
+
+Authentication is off until a credential is configured, which is right for stdio on a laptop and
+wrong for a listening socket — the `security` health check reports `degraded` in exactly that
+case. Once configured, the nine state-mutating tools require a credential and read-only tools
+stay open (`BRIDGE_AUTH_SCOPE=all` closes those too):
+
+```bash
+export BRIDGE_ADMIN_API_KEY="dashboard:$(openssl rand -hex 24)"
+export BRIDGE_TRANSPORT=http
+npm start
+```
+
+```bash
+curl -s localhost:8080/mcp -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"resolve_conflict","arguments":{}}}'
+# → 401, "This operation mutates bridge state and requires a credential."
+```
+
+Enforcement happens at two points against one list: an Express edge in front of `/mcp`, and
+`AdminGuard` on the tools themselves — because stdio never touches Express. The HTTP edge copies
+the verified credential into the call's `_meta`, so a request that passed the socket also passes
+the guard.
 
 ### Pointing at your own codebase
 
@@ -244,22 +308,30 @@ deployed environment.
 
 ```
 src/
-├── index.ts                    bootstrap; stashes the live server for runtime tool registration
-├── app.module.ts               root @McpApp — transport switches on NODE_ENV
+├── index.ts                    bootstrap; body limit, transport, live server handle
+├── app.module.ts               root @McpApp — see shared/transport.ts for what actually applies
 ├── shared/
 │   ├── schemas/                every Zod schema, one place
+│   ├── transport.ts            BRIDGE_TRANSPORT → the env vars NitroStack really reads
+│   ├── security/
+│   │   ├── protected-tools.ts     the authorisation boundary, in one list
+│   │   └── admin.guard.ts         per-tool enforcement (covers stdio)
 │   └── services/
 │       ├── workspace.service.ts   allow-list + traversal budget — the only path to the disk
 │       ├── store.service.ts       atomic-write durable state (the Restate replacement)
 │       ├── semantic.service.ts    embeddings + the two-signal conflict engine
+│       ├── auth.service.ts        API keys + HS256/384/512 JWT on node:crypto
+│       ├── http-hardening.service.ts  50 MB body limit + the Express auth edge
+│       ├── pdf-text.service.ts    PDF text layer extraction for manual ingestion
 │       └── server-registry.ts     live server handle for runtime tool registration
 ├── modules/                    one directory per persona
+│   └── pipeline/effects.service.ts  real git, CI, Jira and Slack execution
 ├── widgets/                    the admin dashboard (Next.js, in-project)
-├── health/                     3 health checks
+├── health/                     4 health checks, including security posture
 └── skills/                     generated at runtime
 fixtures/legacy-monolith/       34-file synthetic enterprise repo with a planted contradiction
 data/                           mock Jira sprint + Teams transcript
-scripts/verify.ts               65-assertion end-to-end suite
+scripts/verify.ts               89-assertion end-to-end suite
 ```
 
 Built with `@nitrostack/core` 1.0.14 · `@nitrostack/cli` 1.0.15 · `@nitrostack/widgets` 1.0.8
