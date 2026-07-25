@@ -1,20 +1,25 @@
 /**
- * Makes a fresh clone runnable with a single `npm install`.
+ * Prepare the widget workspace so `nitrostack-cli build` can bundle it.
  *
- * NitroStack resolves every @Widget route to `src/widgets/out/<name>/index.html`
- * at startup, so a clone that has never been built dies immediately with
- * "Exported HTML for route 'architecture-map' not found" — and the MCP client
- * just reports that the server shut down, which points nowhere near the cause.
- * That build output is derived, so it is correctly absent from git; the fix is
- * to produce it automatically rather than to document a step people will miss.
+ * Invoked from the `build` script (not from an npm lifecycle hook) so that it
+ * runs after the full source tree exists on disk. NitroStack Cloud's fixed
+ * Dockerfile copies package*.json before `npm ci` and only copies the rest of
+ * the tree afterwards, so a `postinstall` hook here would fire before this file
+ * exists and crash the install with MODULE_NOT_FOUND. Chaining it into `build`
+ * dodges that entirely.
  *
- * This deliberately NEVER fails the install. A production or CI install without
- * devDependencies genuinely cannot run the build, and `npm install` blowing up
- * over an optional convenience would be worse than the problem it solves. On
- * failure it prints the one command that fixes things and exits 0.
+ * What this actually does: `nitrostack-cli build` bundles the widgets and
+ * compiles TypeScript, but it assumes the widgets' own npm workspace already
+ * has its dependencies installed. This script installs those, and only those,
+ * if `src/widgets/node_modules` is missing. It never invokes `npm run build`
+ * itself — that would recurse infinitely from inside the `build` script.
+ *
+ * This deliberately NEVER fails the build. A container image that dies over an
+ * optional widget-deps install is worse than the problem it solves; on failure
+ * this prints the one command that fixes things locally and exits 0.
  */
 import { execFileSync } from 'node:child_process';
-import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -38,60 +43,26 @@ const npm = isWindows ? 'npm.cmd' : 'npm';
 const runNpm = (args, opts) =>
   execFileSync(npm, args, { shell: isWindows, windowsHide: true, ...opts });
 
-/** Opt-out for CI and Docker layers that build explicitly. */
+/** Opt-out for CI stages that install widget dependencies separately. */
 if (process.env.BRIDGE_SKIP_POSTINSTALL === 'true') process.exit(0);
 
-const say = (msg) => console.log(`[bridge:postinstall] ${msg}`);
-
-/**
- * True when every widget in the manifest has been exported.
- *
- * Next writes EITHER `out/<route>.html` or `out/<route>/index.html` depending on
- * its trailingSlash setting; this build emits the flat form. Only checking the
- * directory form (as an earlier version did) meant this always answered "no" and
- * rebuilt unconditionally.
- */
-function widgetsAreBuilt() {
-  const out = join(widgets, 'out');
-  if (!existsSync(out)) return false;
-
-  const exported = (route) =>
-    existsSync(join(out, `${route}.html`)) || existsSync(join(out, route, 'index.html'));
-
-  try {
-    const manifest = JSON.parse(readFileSync(join(widgets, 'widget-manifest.json'), 'utf8'));
-    const routes = (manifest.widgets ?? []).map((w) => String(w.uri).replace(/^\//, ''));
-    if (routes.length) return routes.every(exported);
-  } catch {
-    // fall through to the loose check below
-  }
-
-  return readdirSync(out, { withFileTypes: true }).some(
-    (e) => (e.isFile() && e.name.endsWith('.html')) || (e.isDirectory() && existsSync(join(out, e.name, 'index.html')))
-  );
-}
+const say = (msg) => console.log(`[bridge:prebuild] ${msg}`);
 
 try {
   if (!existsSync(join(widgets, 'node_modules'))) {
-    say('installing widget dependencies…');
+    say('installing widget dependencies so nitrostack-cli build can bundle them…');
     runNpm(['install', '--no-audit', '--no-fund'], { cwd: widgets, stdio: 'inherit' });
+    say('widget dependencies installed.');
+  } else {
+    say('widget dependencies already present — nothing to do.');
   }
-
-  if (widgetsAreBuilt()) {
-    say('widgets already built — nothing to do.');
-    process.exit(0);
-  }
-
-  say('building widgets so the MCP server can boot…');
-  runNpm(['run', 'build'], { cwd: root, stdio: 'inherit' });
-  say('ready. Start the server with `npm run dev`, or open the folder in NitroStudio.');
 } catch (error) {
   console.warn(
-    `\n[bridge:postinstall] Could not prepare the widget bundle automatically.\n` +
+    `\n[bridge:prebuild] Could not install widget dependencies automatically.\n` +
       `  Reason: ${error instanceof Error ? error.message : String(error)}\n\n` +
-      `  The MCP server will NOT start until the widgets are built. Run this once:\n\n` +
+      `  The MCP server will NOT start until the widget bundle exists. Run this once:\n\n` +
       `      npm run setup\n\n` +
-      `  (This is only a warning — the install itself succeeded.)\n`
+      `  (This is only a warning — the build itself will still attempt to continue.)\n`
   );
   process.exit(0);
 }
