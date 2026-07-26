@@ -345,15 +345,34 @@ export class ManifestService {
     return fact.evidence.length ? `<sub>Evidence: ${fact.evidence.map((e) => `\`${e}\``).join(', ')}</sub>` : '';
   }
 
-  /** Write the manifest to disk and return the absolute path. */
+  /**
+   * Write the manifest to disk and return the absolute path.
+   *
+   * On read-only container filesystems the project-root default is not
+   * writable, so an EACCES from the primary target automatically falls back to
+   * the writable state directory (which WorkspaceService has already probed at
+   * boot). The caller can still force a specific path via `outputPath`; that
+   * path is respected as-is and its failure surfaces to the tool response.
+   */
   write(target: string, outputPath?: string): { path: string; bytes: number; content: string } {
     const content = this.render(target);
-    const file = outputPath
+    const primary = outputPath
       ? path.resolve(outputPath)
       : path.join(this.workspace.projectRoot, 'CLAUDE.md');
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, content, 'utf8');
-    return { path: file, bytes: Buffer.byteLength(content, 'utf8'), content };
+
+    try {
+      fs.mkdirSync(path.dirname(primary), { recursive: true });
+      fs.writeFileSync(primary, content, 'utf8');
+      return { path: primary, bytes: Buffer.byteLength(content, 'utf8'), content };
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code ?? 'UNKNOWN';
+      if (outputPath || (code !== 'EACCES' && code !== 'EPERM' && code !== 'EROFS')) {
+        throw error;
+      }
+      const fallback = path.join(this.workspace.stateRoot, 'CLAUDE.md');
+      fs.writeFileSync(fallback, content, 'utf8');
+      return { path: fallback, bytes: Buffer.byteLength(content, 'utf8'), content };
+    }
   }
 
   /** Conflicts still blocking a clean synthesis. */

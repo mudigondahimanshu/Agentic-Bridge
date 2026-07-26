@@ -29,7 +29,7 @@ import { applyJsonBodyLimit, hardeningState } from './shared/services/http-harde
 
 // Compile-time build stamp: if this string doesn't appear in the boot banner,
 // Studio is running stale code and needs its server restarted.
-const BUILD_STAMP = '2026-07-26T04:05-swarm-budget+studio-timeout-fit';
+const BUILD_STAMP = '2026-07-26T06:05-eacces-fallback+manifest-writable';
 
 async function bootstrap() {
   // NitroStack picks its transport from MCP_TRANSPORT_TYPE and its listen

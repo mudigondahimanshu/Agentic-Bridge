@@ -12,6 +12,7 @@
  */
 import { Injectable } from '@nitrostack/core';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 
 export interface TraversalLimits {
@@ -77,13 +78,24 @@ export class WorkspaceService {
   constructor() {
     this.projectRoot = WorkspaceService.locateProjectRoot();
     this.fixtureRoot = path.join(this.projectRoot, 'fixtures', 'legacy-monolith');
-    this.stateRoot = path.join(this.projectRoot, '.bridge');
-    this.skillsRoot = path.join(this.projectRoot, 'src', 'skills');
     this.dataRoot = path.join(this.projectRoot, 'data');
 
-    for (const dir of [this.stateRoot, this.skillsRoot]) {
-      fs.mkdirSync(dir, { recursive: true });
-    }
+    // Writable-directory selection. NitroStack Cloud containers own /app as root
+    // but run the process as an unprivileged user, so an unconditional mkdir on
+    // `/app/.bridge` throws EACCES and takes DI resolution down before the
+    // server can start. Prefer an explicit env override, then the project root
+    // (right for laptops), then a per-process directory under os.tmpdir()
+    // (right for read-only containers). Falling back keeps the server bootable;
+    // state is ephemeral in that case, which is acceptable for a demo target
+    // and mount-a-volume-fixable for durability.
+    this.stateRoot = WorkspaceService.ensureWritable(
+      process.env.BRIDGE_STATE_DIR?.trim() || path.join(this.projectRoot, '.bridge'),
+      path.join(os.tmpdir(), 'agentic-bridge-state')
+    );
+    this.skillsRoot = WorkspaceService.ensureWritable(
+      process.env.BRIDGE_SKILLS_DIR?.trim() || path.join(this.projectRoot, 'src', 'skills'),
+      path.join(os.tmpdir(), 'agentic-bridge-skills')
+    );
 
     // Operators can widen the allow-list without editing code.
     const extra = process.env.BRIDGE_ALLOWED_ROOTS;
@@ -92,6 +104,37 @@ export class WorkspaceService {
         const trimmed = raw.trim();
         if (trimmed) this.extraRoots.push(path.resolve(trimmed));
       }
+    }
+  }
+
+  /**
+   * Create `preferred` if writable, otherwise fall back to `fallback`.
+   *
+   * Any write failure on the preferred path (EACCES, EPERM, EROFS, ENOENT on a
+   * missing parent we cannot create) triggers the fallback. Fallback failures
+   * throw — a bridge that has no writable state at all is unrecoverable and
+   * should crash loudly rather than silently corrupt.
+   *
+   * The chosen path is written to stderr so an operator can see, from the boot
+   * log, whether state is going to a mounted volume or to a per-process tmpdir.
+   */
+  private static ensureWritable(preferred: string, fallback: string): string {
+    try {
+      fs.mkdirSync(preferred, { recursive: true });
+      // Confirm we can actually write, not just mkdir. Some container FS layers
+      // return success on mkdir then refuse writes with a different error.
+      const probe = path.join(preferred, `.write-probe-${process.pid}`);
+      fs.writeFileSync(probe, '');
+      fs.unlinkSync(probe);
+      return preferred;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code ?? 'UNKNOWN';
+      console.error(
+        `[bridge] Cannot write to ${preferred} (${code}); falling back to ${fallback}. ` +
+          `Set BRIDGE_STATE_DIR / BRIDGE_SKILLS_DIR to a mounted writable path for durable state.`
+      );
+      fs.mkdirSync(fallback, { recursive: true });
+      return fallback;
     }
   }
 
