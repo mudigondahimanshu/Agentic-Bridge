@@ -71,6 +71,15 @@ async function bootstrap() {
         `JSON body limit ${state.jsonBodyLimit} (via ${state.jsonBodyLimitVia})` +
         (state.httpEdgeInstalled ? '; HTTP auth edge installed' : '')
     );
+    if (transport.type !== 'stdio') {
+      // Printed explicitly because "the platform says the deploy failed but the
+      // app is clearly up" is almost always a probe hitting a path that 404s.
+      console.error(
+        `[bridge] Liveness probes: ${
+          state.probePathsMounted.length ? state.probePathsMounted.join(', ') : 'NONE MOUNTED'
+        } (framework health: /mcp/health)`
+      );
+    }
 
     const llm = DIContainer.getInstance().resolve(LlmService) as LlmService;
     console.error(

@@ -45,6 +45,8 @@ export interface HardeningState {
   authScope: 'mutations' | 'all';
   /** True once the Express auth edge is registered on the HTTP transport. */
   httpEdgeInstalled: boolean;
+  /** Unprefixed liveness paths this process answers, for the boot banner. */
+  probePathsMounted: string[];
 }
 
 const state: HardeningState = {
@@ -53,6 +55,7 @@ const state: HardeningState = {
   authEnabled: false,
   authScope: 'mutations',
   httpEdgeInstalled: false,
+  probePathsMounted: [],
 };
 
 export function hardeningState(): Readonly<HardeningState> {
@@ -127,12 +130,37 @@ interface RouterLayer {
 }
 interface ExpressAppLike {
   use: (...handlers: unknown[]) => unknown;
+  get?: (path: string, ...handlers: unknown[]) => unknown;
   _router?: { stack: RouterLayer[] };
   router?: { stack: RouterLayer[] };
 }
 
+/**
+ * Root-level liveness paths.
+ *
+ * NitroStack mounts its own health route under the MCP endpoint — `/mcp/health`
+ * — but orchestrators (NitroCloud, Kubernetes, Cloud Run, ECS) probe an
+ * unprefixed path and mark a deployment failed when it 404s. The app being
+ * demonstrably up while the platform reports a failed rollout is the exact
+ * symptom that produces. These are aliases, not a second health system.
+ */
+const PROBE_PATHS = ['/health', '/healthz', '/readyz', '/livez'];
+
 function routerStack(app: ExpressAppLike): RouterLayer[] | null {
   return app._router?.stack ?? app.router?.stack ?? null;
+}
+
+/**
+ * Is this request a health/liveness probe?
+ *
+ * Covers the root aliases mounted above and the framework's own
+ * `<endpoint>/health` (`/mcp/health`, `/sse/health`), whatever endpoint the
+ * transport was configured with.
+ */
+function isHealthPath(req: { path?: string; url?: string }): boolean {
+  const raw = req.path ?? req.url ?? '';
+  const path = raw.split('?')[0].replace(/\/+$/, '') || '/';
+  return PROBE_PATHS.includes(path) || path.endsWith('/health');
 }
 
 @Injectable({ deps: [AuthService] })
@@ -165,9 +193,44 @@ export class HttpHardeningService implements OnApplicationBootstrap {
 
     await this.ensureJsonBodyLimit(app);
 
+    // Before the auth edge, deliberately: a readiness probe arrives without a
+    // credential, and a 401 fails a rollout just as surely as a 404.
+    this.mountProbeRoutes(app);
+
     app.use(this.authEdge());
     app.use(this.payloadErrorHandler());
     state.httpEdgeInstalled = true;
+  }
+
+  /**
+   * Answer the unprefixed liveness paths an orchestrator expects.
+   *
+   * Reports 200 as soon as the process is serving. This is deliberately a
+   * liveness signal and not an aggregate of the `@HealthCheck` classes: those
+   * report `degraded` for conditions that are perfectly legitimate in a
+   * container — no admin key on a private network, no git binary, fixtures
+   * instead of live Jira — and failing a deployment for any of them would be
+   * wrong. `/mcp/health` and the `health://checks` resource still carry the
+   * detailed per-subsystem view.
+   */
+  private mountProbeRoutes(app: ExpressAppLike): void {
+    if (typeof app.get !== 'function') return;
+
+    for (const path of PROBE_PATHS) {
+      try {
+        app.get(path, (_req: HttpRequestLike, res: HttpResponseLike) => {
+          res.status(200).json({
+            status: 'ok',
+            service: 'enterprise-agentic-bridge',
+            uptimeSeconds: Math.round(process.uptime()),
+            mcpEndpoint: '/mcp',
+          });
+        });
+        state.probePathsMounted.push(path);
+      } catch {
+        // A path already claimed by the framework is fine — theirs answers.
+      }
+    }
   }
 
   /**
@@ -221,6 +284,12 @@ export class HttpHardeningService implements OnApplicationBootstrap {
     // interfaces, which are not available at the top level of this project.
     return (req: HttpRequestLike, res: HttpResponseLike, next: (error?: unknown) => void): void => {
       if (!this.auth.enabled) return next();
+
+      // Health endpoints are never gated, under any scope. `all` is meant to
+      // cover the MCP protocol surface, not to make the service unmonitorable:
+      // an orchestrator's probe arrives without a credential, and a 401 there
+      // fails the rollout of an otherwise healthy container.
+      if (isHealthPath(req)) return next();
 
       const body = req.body as JsonRpcCall | JsonRpcCall[] | undefined;
       const calls = Array.isArray(body) ? body : body ? [body] : [];
@@ -304,6 +373,8 @@ interface HttpRequestLike {
   body?: unknown;
   headers?: Record<string, string | string[] | undefined>;
   get?: (name: string) => string | undefined;
+  path?: string;
+  url?: string;
 }
 
 interface HttpResponseLike {

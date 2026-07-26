@@ -310,6 +310,60 @@ npm run doctor              # integration status, with fixes
 
 ---
 
+## Deploying to NitroCloud (or any container platform)
+
+The server boots and binds correctly in production — the failure mode to know about is a
+platform marking the rollout failed while the logs show a perfectly healthy app. That is a
+**probe** problem, not a boot problem.
+
+**Endpoint map, verified in production mode:**
+
+| Path | Answers | Notes |
+|---|---|---|
+| `/health` `/healthz` `/readyz` `/livez` | 200 | mounted by this project for orchestrators; never require a credential |
+| `/mcp/health` | 200 | NitroStack's own; note the `/mcp` prefix |
+| `/mcp` | MCP protocol | POST/GET/DELETE; credential required per `BRIDGE_AUTH_SCOPE` |
+| `/` | docs page | **401 when `BRIDGE_AUTH_SCOPE=all`** |
+
+Reproduce the container's exact conditions locally before redeploying:
+
+```bash
+NODE_ENV=production PORT=3000 HOST=0.0.0.0 \
+  BRIDGE_ADMIN_API_KEY=... BRIDGE_AUTH_SCOPE=... \
+  npx tsx src/index.ts
+
+curl -i http://127.0.0.1:3000/health      # must be 200
+curl -i http://127.0.0.1:3000/mcp/health  # must be 200
+```
+
+The boot banner now names the mounted probe paths, so a deploy log answers the question directly:
+
+```
+[bridge] Liveness probes: /health, /healthz, /readyz, /livez (framework health: /mcp/health)
+```
+
+If it prints `NONE MOUNTED`, the transport did not expose an Express app and the platform has
+only `/mcp/health` to probe.
+
+**Checklist when a deploy fails but the app logs look healthy:**
+
+1. **What path does the platform probe, and does it 404?** Health lives at `/mcp/health` under
+   NitroStack's own routing; the unprefixed aliases above exist because most orchestrators
+   assume `/health`.
+2. **Is `BRIDGE_AUTH_SCOPE=all` set?** Under `all` every non-health path needs a credential,
+   including `/`. A probe hitting `/` gets 401 and fails the rollout. Use the default
+   (`mutations`) unless you specifically need reads gated too.
+3. **Is the probe on the right port?** The app honours `PORT`; confirm the platform's expected
+   port matches the `[bridge] Transport:` line in the logs.
+4. **`Cannot write to /app/.bridge (EACCES)`** is expected on a read-only container and is
+   non-fatal — state falls back to a tmpdir. For durable knowledge across restarts, mount a
+   volume and set `BRIDGE_STATE_DIR` to it.
+5. **`git` may be absent from a slim runtime image.** Without it, GitHub-URL targets cannot be
+   cloned; the `live-data` health check reports this. Local paths still work.
+
+Note that health checks reporting `degraded` (no admin key, no git, fixtures instead of live
+Jira) are legitimate operating states and deliberately do **not** fail the liveness probes.
+
 ## Known issues
 
 - **`npm run verify` reports `4 FAILED, 67 passed` on a clean checkout.** One root cause: the
