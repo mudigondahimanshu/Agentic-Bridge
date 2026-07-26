@@ -1,5 +1,6 @@
 import { Module } from '@nitrostack/core';
 import { WorkspaceService } from './services/workspace.service.js';
+import { RepoSourceService } from './services/repo-source.service.js';
 import { StoreService } from './services/store.service.js';
 import { SemanticService } from './services/semantic.service.js';
 import { AuthService } from './services/auth.service.js';
@@ -20,6 +21,7 @@ import { AdminGuard } from './security/admin.guard.js';
   name: 'shared',
   description: 'Workspace, durable store, semantic search, LLM reasoning and transport security',
   providers: [
+    RepoSourceService,
     WorkspaceService,
     StoreService,
     SemanticService,
@@ -31,6 +33,7 @@ import { AdminGuard } from './security/admin.guard.js';
     KnowledgeSearchService,
   ],
   exports: [
+    RepoSourceService,
     WorkspaceService,
     StoreService,
     SemanticService,

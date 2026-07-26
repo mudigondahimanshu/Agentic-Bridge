@@ -2,8 +2,8 @@ import { Injectable, ToolDecorator as Tool, Widget, ExecutionContext, z, UseGuar
 import { AdminGuard } from '../../shared/security/admin.guard.js';
 import * as path from 'path';
 import * as fs from 'fs';
-import { ManifestService } from './manifest.service.js';
-import { WorkspaceService } from '../../shared/services/workspace.service.js';
+import { ManifestService, type WrittenManifest } from './manifest.service.js';
+import { WorkspaceService, describeSource } from '../../shared/services/workspace.service.js';
 import { StoreService } from '../../shared/services/store.service.js';
 import { PdfTextService } from '../../shared/services/pdf-text.service.js';
 import { TargetSchema } from '../../shared/schemas/index.js';
@@ -35,7 +35,11 @@ export class SynthesisTools {
       output_path: z
         .string()
         .optional()
-        .describe('Where to write the manifest. Defaults to CLAUDE.md in the bridge project root.'),
+        .describe(
+          'Where to write the manifest. Defaults to CLAUDE.md at the root of the analysed ' +
+            'repository; for a remote (GitHub URL) target the clone is ephemeral, so the manifest ' +
+            'is archived under the state directory and returned in `content` instead.'
+        ),
       allow_unresolved: z
         .boolean()
         .default(false)
@@ -76,23 +80,34 @@ export class SynthesisTools {
       );
     }
 
-    const target = this.workspace.resolveTarget(input.target);
-    const result = this.manifest.write(target, input.output_path);
+    const handle = await this.workspace.acquireTarget(input.target);
+    let result;
+    try {
+      result = this.manifest.write(handle, input.output_path);
+    } finally {
+      await handle.cleanup();
+    }
 
     const run = this.store.latestRun();
     if (run) {
-      this.store.upsert('runs', {
-        ...run,
-        manifestPath: this.workspace.rel(this.workspace.projectRoot, result.path),
-      });
+      this.store.upsert('runs', { ...run, manifestPath: result.path });
     }
 
-    ctx.logger.info('Manifest synthesized', { path: result.path, bytes: result.bytes });
+    ctx.logger.info('Manifest synthesized', {
+      path: result.path,
+      bytes: result.bytes,
+      destination: result.destination,
+    });
 
     return {
       written: true,
       path: this.workspace.rel(this.workspace.projectRoot, result.path),
       absolutePath: result.path,
+      // Where it went and why. A remote analysis cannot write into the repo it
+      // just cloned, so the agent needs to be told to place `content` itself.
+      destination: result.destination,
+      source: describeSource(handle),
+      placementNote: this.placementNote(result),
       bytes: result.bytes,
       lines: result.content.split('\n').length,
       factsUsed: facts.length,
@@ -101,6 +116,27 @@ export class SynthesisTools {
       unresolvedConflicts: blocking.length,
       content: result.content,
     };
+  }
+
+  /** Tell the calling agent what, if anything, it still has to do with the manifest. */
+  private placementNote(result: WrittenManifest): string {
+    switch (result.destination) {
+      case 'analyzed-repo':
+        return `Written to CLAUDE.md in the analysed repository. Nothing further to do.`;
+      case 'clone-archive':
+        return (
+          `The target was a remote repository, cloned to a temp directory that has now been deleted, ` +
+          `so the manifest could not be written into it. A copy is archived at ${result.path}; ` +
+          `write the returned \`content\` to CLAUDE.md at the root of your checkout of that repository.`
+        );
+      case 'fallback':
+        return (
+          `The analysed directory was not writable, so the manifest was written to ${result.path}. ` +
+          `Copy the returned \`content\` into the repository yourself.`
+        );
+      default:
+        return `Written to the path you requested.`;
+    }
   }
 
   @Tool({

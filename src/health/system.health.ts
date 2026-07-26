@@ -11,12 +11,29 @@ import {
   type HealthCheckResult,
 } from '@nitrostack/core';
 import * as fs from 'fs';
+import { execFileSync } from 'child_process';
 import { WorkspaceService } from '../shared/services/workspace.service.js';
+import { JiraClient } from '../modules/agile/jira.client.js';
+import { SlackClient } from '../modules/agile/chat.client.js';
 import { StoreService } from '../shared/services/store.service.js';
 import { AuthService } from '../shared/services/auth.service.js';
 import { hardeningState } from '../shared/services/http-hardening.service.js';
 import { EffectsService } from '../modules/pipeline/effects.service.js';
 import { resolveTransportType } from '../shared/transport.js';
+
+/** Probed once: git either exists on this host for the process lifetime, or it does not. */
+let gitAvailable: boolean | undefined;
+function hasGit(): boolean {
+  if (gitAvailable === undefined) {
+    try {
+      execFileSync('git', ['--version'], { stdio: 'ignore', timeout: 5000 });
+      gitAvailable = true;
+    } catch {
+      gitAvailable = false;
+    }
+  }
+  return gitAvailable;
+}
 
 @HealthCheck({
   name: 'system',
@@ -115,6 +132,51 @@ export class SecurityHealthCheck implements HealthCheckInterface {
             .filter(([, wired]) => wired)
             .map(([name]) => name)
             .join(', ') || 'none',
+      },
+    };
+  }
+}
+
+@HealthCheck({
+  name: 'live-data',
+  description: 'Live enterprise integrations and remote codebase ingestion',
+  interval: 60,
+})
+@Injectable({ deps: [JiraClient, SlackClient] })
+export class LiveDataHealthCheck implements HealthCheckInterface {
+  constructor(
+    private jira: JiraClient,
+    private slack: SlackClient
+  ) {}
+
+  async check(): Promise<HealthCheckResult> {
+    const mode = process.env.BRIDGE_DATA_MODE?.trim().toLowerCase() || 'auto';
+    const jira = this.jira.configured;
+    const slack = this.slack.configured;
+    // Remote targets are unusable without git on PATH, and that is far easier
+    // to diagnose here than from a failed clone inside a tool call.
+    const git = hasGit();
+
+    const gaps = [!jira && 'Jira', !slack && 'Slack', !git && 'git'].filter(Boolean);
+
+    return {
+      // Fixtures are a legitimate way to run this server, so missing
+      // credentials are "degraded", not "down" — but they are never silent.
+      status: jira && slack && git ? 'up' : 'degraded',
+      message:
+        jira && slack && git
+          ? `Live Jira and Slack configured; remote repository ingestion available (mode=${mode})`
+          : `Running without: ${gaps.join(', ')}. ` +
+            (mode === 'fixture'
+              ? 'BRIDGE_DATA_MODE=fixture, so live sources are disabled deliberately.'
+              : 'Affected tools fall back to bundled fixtures and report dataSource="fixture".'),
+      details: {
+        dataMode: mode,
+        jira: jira ? 'configured' : this.jira.missing().join(', ') + ' missing',
+        slack: slack ? 'configured' : this.slack.missing().join(', ') + ' missing',
+        git: git ? 'available' : 'not on PATH — GitHub URL targets will fail',
+        allowedRepoHosts: process.env.BRIDGE_ALLOWED_REPO_HOSTS?.trim() || 'github.com',
+        githubToken: process.env.GITHUB_TOKEN?.trim() ? 'set (private repos clonable)' : 'unset (public only)',
       },
     };
   }

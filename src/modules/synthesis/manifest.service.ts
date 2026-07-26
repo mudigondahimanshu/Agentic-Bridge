@@ -19,8 +19,18 @@ import { Injectable } from '@nitrostack/core';
 import * as fs from 'fs';
 import * as path from 'path';
 import { StoreService } from '../../shared/services/store.service.js';
-import { WorkspaceService } from '../../shared/services/workspace.service.js';
+import { WorkspaceService, type TargetHandle } from '../../shared/services/workspace.service.js';
 import type { Conflict, KnowledgeFact } from '../../shared/schemas/index.js';
+
+export interface WrittenManifest {
+  path: string;
+  bytes: number;
+  content: string;
+  /** Why the manifest landed where it did — surfaced to the caller. */
+  destination: 'explicit' | 'analyzed-repo' | 'clone-archive' | 'fallback';
+  /** True when the target was a clone that no longer exists after this call. */
+  ephemeralTarget: boolean;
+}
 
 @Injectable({ deps: [StoreService, WorkspaceService] })
 export class ManifestService {
@@ -346,32 +356,52 @@ export class ManifestService {
   }
 
   /**
-   * Write the manifest to disk and return the absolute path.
+   * Write the manifest to disk and return where it landed.
    *
-   * On read-only container filesystems the project-root default is not
-   * writable, so an EACCES from the primary target automatically falls back to
-   * the writable state directory (which WorkspaceService has already probed at
-   * boot). The caller can still force a specific path via `outputPath`; that
-   * path is respected as-is and its failure surfaces to the tool response.
+   * Destination follows the target, which is the only rule that makes sense
+   * once this server analyses repositories other than its own:
+   *
+   *   - explicit `outputPath` wins, always, and its failure is the caller's;
+   *   - a local target gets `<target>/CLAUDE.md` — the manifest belongs beside
+   *     the code it describes, which is where a coding agent will look for it;
+   *   - a remote target is a temp clone about to be deleted, so the manifest is
+   *     archived under the state directory instead and the full content is
+   *     returned for the caller to place wherever it wants.
+   *
+   * On read-only container filesystems the preferred path may not be writable,
+   * so EACCES/EPERM/EROFS falls back to the state directory (which
+   * WorkspaceService already probed at boot) rather than losing the manifest.
    */
-  write(target: string, outputPath?: string): { path: string; bytes: number; content: string } {
-    const content = this.render(target);
-    const primary = outputPath
-      ? path.resolve(outputPath)
-      : path.join(this.workspace.projectRoot, 'CLAUDE.md');
+  write(handle: TargetHandle, outputPath?: string): WrittenManifest {
+    const content = this.render(handle.remote ? handle.label : handle.root);
+    const bytes = Buffer.byteLength(content, 'utf8');
 
+    if (outputPath) {
+      const explicit = path.resolve(outputPath);
+      fs.mkdirSync(path.dirname(explicit), { recursive: true });
+      fs.writeFileSync(explicit, content, 'utf8');
+      return { path: explicit, bytes, content, destination: 'explicit', ephemeralTarget: handle.remote };
+    }
+
+    if (handle.remote) {
+      const archive = path.join(this.workspace.stateRoot, 'manifests');
+      const name = `${(handle.repo?.slug ?? 'repo').replace(/\//g, '-')}-CLAUDE.md`;
+      fs.mkdirSync(archive, { recursive: true });
+      const written = path.join(archive, name);
+      fs.writeFileSync(written, content, 'utf8');
+      return { path: written, bytes, content, destination: 'clone-archive', ephemeralTarget: true };
+    }
+
+    const beside = path.join(handle.root, 'CLAUDE.md');
     try {
-      fs.mkdirSync(path.dirname(primary), { recursive: true });
-      fs.writeFileSync(primary, content, 'utf8');
-      return { path: primary, bytes: Buffer.byteLength(content, 'utf8'), content };
+      fs.writeFileSync(beside, content, 'utf8');
+      return { path: beside, bytes, content, destination: 'analyzed-repo', ephemeralTarget: false };
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code ?? 'UNKNOWN';
-      if (outputPath || (code !== 'EACCES' && code !== 'EPERM' && code !== 'EROFS')) {
-        throw error;
-      }
+      if (code !== 'EACCES' && code !== 'EPERM' && code !== 'EROFS') throw error;
       const fallback = path.join(this.workspace.stateRoot, 'CLAUDE.md');
       fs.writeFileSync(fallback, content, 'utf8');
-      return { path: fallback, bytes: Buffer.byteLength(content, 'utf8'), content };
+      return { path: fallback, bytes, content, destination: 'fallback', ephemeralTarget: false };
     }
   }
 

@@ -19,6 +19,20 @@ export const DRIFT_THRESHOLD = 0.7;
 /** At or above this divergence, the two sources are making incompatible choices. */
 export const CONTRADICTION_THRESHOLD = 0.6;
 
+/**
+ * Name the system a spoken decision came from, inferred from the transcript the
+ * Scrum Analyst produced. A conflict ruling ends up in section 0 of CLAUDE.md
+ * citing this, so "Microsoft Teams" on a Slack-sourced decision would be a
+ * fabricated citation.
+ */
+function originOf(transcript: MeetingTranscript): string {
+  const haystack = `${transcript.source} ${transcript.title}`.toLowerCase();
+  if (haystack.includes('slack')) return 'Slack';
+  if (haystack.includes('teams')) return 'Microsoft Teams';
+  if (haystack.includes('discord')) return 'Discord';
+  return 'Team chat';
+}
+
 @Injectable({ deps: [SemanticService, StoreService] })
 export class ConflictService {
   constructor(
@@ -81,7 +95,10 @@ export class ConflictService {
             text: `${issue.summary} — ${issue.description}`,
           },
           sourceB: {
-            origin: 'Microsoft Teams',
+            // Derived, not hardcoded: the spoken record comes from Slack when
+            // that is configured and from the bundled Teams fixture otherwise,
+            // and a ruling written into CLAUDE.md must cite the right system.
+            origin: originOf(transcript),
             ref: `${transcript.title} ${decision.timestamp ?? ''} ${decision.speaker ?? ''}`.trim(),
             text: decision.text,
           },

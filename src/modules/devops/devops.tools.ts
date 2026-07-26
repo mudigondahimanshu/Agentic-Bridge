@@ -1,6 +1,10 @@
 import { Injectable, ToolDecorator as Tool, ExecutionContext } from '@nitrostack/core';
 import { DevOpsService } from './devops.service.js';
-import { WorkspaceService } from '../../shared/services/workspace.service.js';
+import {
+  WorkspaceService,
+  describeSource,
+  type TargetHandle,
+} from '../../shared/services/workspace.service.js';
 import { StoreService } from '../../shared/services/store.service.js';
 import { TargetSchema } from '../../shared/schemas/index.js';
 import type { KnowledgeFact } from '../../shared/schemas/index.js';
@@ -33,7 +37,17 @@ export class DevOpsTools {
     },
   })
   async parseCiCdPipelines(input: { target?: string }, ctx: ExecutionContext) {
-    const target = this.workspace.resolveTarget(input.target);
+    // Remote targets are cloned by acquireTarget and deleted in the finally.
+    const handle = await this.workspace.acquireTarget(input.target);
+    try {
+      return this.pipelines(handle, ctx);
+    } finally {
+      await handle.cleanup();
+    }
+  }
+
+  private pipelines(handle: TargetHandle, ctx: ExecutionContext) {
+    const target = handle.root;
     const report = this.devops.analyse(target);
     ctx.logger.info('DevOps Navigator complete', { pipelines: report.pipelines.length });
 
@@ -104,6 +118,6 @@ export class DevOpsTools {
     this.store.clearAgentFacts('devops-navigator');
     this.store.addFacts(facts);
 
-    return report;
+    return { ...report, source: describeSource(handle) };
   }
 }

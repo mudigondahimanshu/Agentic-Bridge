@@ -17,14 +17,21 @@ export class ConflictTools {
     name: 'detect_conflicts',
     title: 'Detect context conflicts',
     description:
-      'Cross-references the Jira sprint against the Teams transcript and raises a conflict ' +
+      'Cross-references the live Jira sprint against the team chat record (Slack, or the bundled ' +
+      'transcript fixture) and raises a conflict ' +
       'wherever the written ticket and the spoken decision disagree. Scores every pair on two ' +
       'axes: cosine ALIGNMENT (are they about the same thing?) and decision DIVERGENCE (do they ' +
       'choose differently?). A contradiction is high alignment plus high divergence — the case ' +
       'a similarity threshold alone provably cannot catch. Emits an interactive resolution widget.',
     inputSchema: z.object({
-      jira_source: z.string().optional().describe('Override path to the Jira fixture'),
-      transcript_source: z.string().optional().describe('Override path to the transcript fixture'),
+      jira_source: z
+        .string()
+        .optional()
+        .describe('Read this local file instead of calling Jira. Omit to use the live sprint.'),
+      transcript_source: z
+        .string()
+        .optional()
+        .describe('Read this local file instead of calling Slack. Omit to use the live channel.'),
     }),
     // Studio renders this payload in the widget preview before the tool is ever
     // run, so it must be a faithful sample of the real return shape — not a
@@ -37,7 +44,9 @@ export class ConflictTools {
         thresholds: { driftBelow: 0.7, contradictionAtOrAbove: 0.6 },
         sources: {
           jira: 'AUR / Sprint 41 - Invoice Read Path',
-          teams: 'Microsoft Teams — Aurora Billing / Sprint 41 Daily Scrum',
+          chat: 'Slack — #aurora-billing',
+          jiraDataSource: 'jira-live',
+          chatDataSource: 'slack-live',
         },
         conflicts: [
           {
@@ -72,8 +81,10 @@ export class ConflictTools {
     input: { jira_source?: string; transcript_source?: string },
     ctx: ExecutionContext
   ) {
-    const sprint = this.agile.loadSprint(input.jira_source);
-    const transcript = this.agile.loadTranscript(input.transcript_source);
+    const sprintSource = await this.agile.loadSprint(input.jira_source);
+    const transcriptSource = await this.agile.loadTranscript(input.transcript_source);
+    const sprint = sprintSource.value;
+    const transcript = transcriptSource.value;
 
     const conflicts = this.conflicts.detect(sprint, transcript);
     const open = conflicts.filter((c) => c.status === 'open');
@@ -87,7 +98,16 @@ export class ConflictTools {
       conflictCount: conflicts.length,
       openCount: open.length,
       thresholds: { driftBelow: DRIFT_THRESHOLD, contradictionAtOrAbove: CONTRADICTION_THRESHOLD },
-      sources: { jira: `${sprint.board} / ${sprint.sprint.name}`, teams: transcript.title },
+      sources: {
+        jira: `${sprint.board} / ${sprint.sprint.name}`,
+        chat: transcript.title,
+        // A conflict between two fixtures is a demo; between two live systems
+        // it is a finding. The reader needs to know which one this is.
+        jiraDataSource: sprintSource.dataSource,
+        chatDataSource: transcriptSource.dataSource,
+      },
+      configurationHints: [sprintSource.configurationHint, transcriptSource.configurationHint].filter(Boolean),
+      warnings: [sprintSource.warning, transcriptSource.warning].filter(Boolean),
       conflicts,
       nextStep: open.length
         ? 'Resolve each conflict in the widget, or call resolve_conflict with the conflict_id.'

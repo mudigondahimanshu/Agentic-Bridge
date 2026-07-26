@@ -45,7 +45,7 @@ export class BridgePrompts {
           `I will run the bridge end to end.\n\n` +
           `**Step 1 — reconnaissance.** Call \`run_swarm\`${args.target ? ` with target="${args.target}"` : ''}. ` +
           `That dispatches all seven personas and commits their findings to the durable knowledge base.\n\n` +
-          `**Step 2 — conflicts.** The swarm cross-references the Jira sprint against the Teams ` +
+          `**Step 2 — conflicts.** The swarm cross-references the Jira sprint against the team chat ` +
           `transcript. If they disagree it pauses in \`awaiting-resolution\` rather than guessing. ` +
           `I will show you each conflict with its alignment and divergence scores and ask you to rule ` +
           `on it — I will not pick for you, because the whole point is that the manifest reflects a ` +

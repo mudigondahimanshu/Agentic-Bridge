@@ -194,10 +194,16 @@ export class SkillRuntimeService {
       annotations: { readOnlyHint: true },
       handler: async (input: unknown, ctx: ExecutionContext) => {
         const params = (input ?? {}) as Record<string, unknown>;
-        const target = this.workspace.resolveTarget(params.target as string | undefined);
-        ctx.logger.info(`Generated skill invoked: ${spec.name}`, { target });
-        const result = await handler(params, this.buildApi(target));
-        return { skill: spec.name, target: this.workspace.rel(this.workspace.projectRoot, target), result };
+        // Minted skills inherit remote-target support: a generated tool is only
+        // as portable as the traversal underneath it.
+        const handle = await this.workspace.acquireTarget(params.target as string | undefined);
+        try {
+          ctx.logger.info(`Generated skill invoked: ${spec.name}`, { target: handle.label });
+          const result = await handler(params, this.buildApi(handle.root));
+          return { skill: spec.name, target: handle.label, result };
+        } finally {
+          await handle.cleanup();
+        }
       },
     });
 
@@ -248,23 +254,30 @@ export class ${className}Skill {
     name: ${JSON.stringify(spec.name)},
     description: ${JSON.stringify(`[generated skill] ${spec.description}`)},
     inputSchema: z.object({
-      target: z.string().optional().describe('Absolute path to the codebase. Omit for the bundled fixture.'),
+      target: z
+        .string()
+        .optional()
+        .describe('GitHub repository URL or absolute path. Omit for the bundled fixture.'),
 ${zodFields}
     }),
     annotations: { readOnlyHint: true },
   })
   async run(input: Record<string, unknown>, ctx: ExecutionContext) {
-    const target = this.workspace.resolveTarget(input.target as string | undefined);
-    ctx.logger.info('Generated skill invoked: ${spec.name}', { target });
-    const handler = this.runtime.compile({
-      name: ${JSON.stringify(spec.name)},
-      description: ${JSON.stringify(spec.description)},
-      params: ${JSON.stringify(spec.params)},
-      body: SKILL_BODY,
-      rationale: ${JSON.stringify(spec.rationale)},
-    });
-    const result = await handler(input, this.runtime.buildApi(target));
-    return { skill: ${JSON.stringify(spec.name)}, result };
+    const handle = await this.workspace.acquireTarget(input.target as string | undefined);
+    try {
+      ctx.logger.info('Generated skill invoked: ${spec.name}', { target: handle.label });
+      const handler = this.runtime.compile({
+        name: ${JSON.stringify(spec.name)},
+        description: ${JSON.stringify(spec.description)},
+        params: ${JSON.stringify(spec.params)},
+        body: SKILL_BODY,
+        rationale: ${JSON.stringify(spec.rationale)},
+      });
+      const result = await handler(input, this.runtime.buildApi(handle.root));
+      return { skill: ${JSON.stringify(spec.name)}, target: handle.label, result };
+    } finally {
+      await handle.cleanup();
+    }
   }
 }
 `;

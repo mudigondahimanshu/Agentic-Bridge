@@ -21,7 +21,11 @@ import { UiUxService } from '../uiux/uiux.service.js';
 import { AgileService } from '../agile/agile.service.js';
 import { ConflictService } from '../conflict/conflict.service.js';
 import { ManifestService } from '../synthesis/manifest.service.js';
-import { WorkspaceService } from '../../shared/services/workspace.service.js';
+import {
+  WorkspaceService,
+  describeSource,
+  type TargetHandle,
+} from '../../shared/services/workspace.service.js';
 import { StoreService } from '../../shared/services/store.service.js';
 import { LlmService, describeFailure, ZERO_USAGE, addUsage } from '../../shared/services/llm.service.js';
 import type { TokenUsage } from '../../shared/services/llm.service.js';
@@ -37,11 +41,23 @@ import type { KnowledgeFact, SwarmRun } from '../../shared/schemas/index.js';
  */
 const SWARM_TOOL_BUILD = '2026-07-26T04:05-swarm-budget+studio-timeout-fit';
 
+interface PersonaResult {
+  facts: KnowledgeFact[];
+  summary: string;
+  evidence: unknown;
+}
+
 interface AgentDefinition {
   agent: (typeof SWARM_AGENTS)[number];
   title: string;
-  /** Returns the facts this persona contributes, plus a one-line summary. */
-  run: (target: string) => { facts: KnowledgeFact[]; summary: string; evidence: unknown };
+  /**
+   * Returns the facts this persona contributes, plus a one-line summary.
+   *
+   * Async because two of the seven personas now read a live enterprise API
+   * rather than a file on disk. The filesystem personas stay synchronous
+   * internally and simply resolve immediately.
+   */
+  run: (target: string) => PersonaResult | Promise<PersonaResult>;
 }
 
 @Injectable({
@@ -82,17 +98,19 @@ export class SwarmTools {
     description:
       'Runs all seven specialist agents over a legacy codebase in one pass: Structural ' +
       'Cartographer, Documentation Synthesizer, QA Analyst, DevOps Navigator, Product ' +
-      'Synchronizer, Scrum Analyst and UI/UX Integrator. Each commits its findings to the ' +
-      'durable knowledge base as it completes, then the orchestrator cross-references Jira ' +
-      'against the Teams transcript. If they contradict each other the run PAUSES in the ' +
-      "`awaiting-resolution` state rather than guessing — resolve it and the run resumes. " +
-      'Optionally synthesizes CLAUDE.md at the end. Reports progress via MCP tasks.',
+      'Synchronizer, Scrum Analyst and UI/UX Integrator. `target` may be a GitHub repository ' +
+      'URL (shallow-cloned into a temp directory, traversed for real, then deleted) or an ' +
+      'absolute path on the machine hosting this server. Each agent commits its findings to ' +
+      'the durable knowledge base as it completes, then the orchestrator cross-references the ' +
+      'live Jira sprint against the team chat record. If they contradict each other the run ' +
+      "PAUSES in the `awaiting-resolution` state rather than guessing — resolve it and the run " +
+      'resumes. Optionally synthesizes CLAUDE.md at the end. Reports progress via MCP tasks.',
     inputSchema: TargetSchema.extend({
       synthesize: z
         .boolean()
         .default(true)
         .describe('Write CLAUDE.md at the end, if no conflicts are blocking'),
-      detect_conflicts: z.boolean().default(true).describe('Cross-reference Jira against the Teams transcript'),
+      detect_conflicts: z.boolean().default(true).describe('Cross-reference the Jira sprint against the team chat record'),
     }),
     taskSupport: 'optional',
     // Kept deliberately complete. Studio renders `examples.response` in the widget
@@ -147,14 +165,19 @@ export class SwarmTools {
     // sees when the swarm silently fails on a bad target path.
     let run: SwarmRun | undefined;
     const llmAvailable = this.llm.available;
+    // Acquired outside the LLM budget below on purpose: a shallow clone of a
+    // real repository can take seconds, and charging that to the reasoning
+    // budget would silently starve the personas on a slow network.
+    let handle: TargetHandle | undefined;
 
     try {
-      const target = this.workspace.resolveTarget(input.target);
+      handle = await this.workspace.acquireTarget(input.target);
+      const target = handle.root;
       const definitions = this.definitions();
 
       run = {
         id: `run-${this.store.all('runs').length + 1}-${Date.now().toString(36)}`,
-        target: this.workspace.rel(this.workspace.projectRoot, target) || target,
+        target: handle.label,
         startedAt: new Date().toISOString(),
         status: 'running',
         agents: definitions.map((d) => ({
@@ -170,12 +193,13 @@ export class SwarmTools {
 
       ctx.logger.info('Swarm dispatched', {
         runId: run.id,
-        target,
+        target: handle.label,
+        remote: handle.remote,
         agents: definitions.length,
         llm: llmAvailable ? this.llm.description : 'disabled',
       });
 
-      return await this.executeSwarm(input, ctx, target, definitions, llmAvailable, run);
+      return await this.executeSwarm(input, ctx, handle, definitions, llmAvailable, run);
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       ctx.logger.error('Swarm run aborted', {
@@ -206,6 +230,9 @@ export class SwarmTools {
         nextStep: this.diagnoseNextStep(detail),
         buildStamp: SWARM_TOOL_BUILD,
       };
+    } finally {
+      // The clone outlives neither the happy path nor the failure path.
+      await handle?.cleanup();
     }
   }
 
@@ -227,6 +254,21 @@ export class SwarmTools {
         'fixture, or add your project to BRIDGE_ALLOWED_ROOTS (see .env.example) and restart.'
       );
     }
+    if (lower.includes('private or does not exist') || lower.includes('was not found on')) {
+      return (
+        'The repository could not be cloned. Check the URL, and set GITHUB_TOKEN with repo read ' +
+        'access if it is private.'
+      );
+    }
+    if (lower.includes('host allow-list')) {
+      return 'That git host is not permitted. Add it to BRIDGE_ALLOWED_REPO_HOSTS and restart.';
+    }
+    if (lower.includes('git is not installed')) {
+      return 'Install git on the host running this server, or pass a local absolute path as `target`.';
+    }
+    if (lower.includes('exceeded') && lower.includes('cloning')) {
+      return 'The clone timed out. Raise BRIDGE_CLONE_TIMEOUT_MS, or analyse a smaller repository.';
+    }
     if (lower.includes('rate limit') || lower.includes('429')) {
       return 'Rate limited by the LLM provider. Wait a minute or call configure_llm to switch models.';
     }
@@ -239,11 +281,12 @@ export class SwarmTools {
   private async executeSwarm(
     input: { target?: string; synthesize?: boolean; detect_conflicts?: boolean },
     ctx: ExecutionContext,
-    target: string,
+    handle: TargetHandle,
     definitions: AgentDefinition[],
     llmAvailable: boolean,
     run: SwarmRun
   ) {
+    const target = handle.root;
     let swarmUsage: TokenUsage = { ...ZERO_USAGE };
     const llmNotes: { agent: string; reasonedFacts: number; failure?: string }[] = [];
     // Rate-limit latch: once we've seen N consecutive 429s from the provider,
@@ -269,32 +312,34 @@ export class SwarmTools {
     // serially costs nothing but wall clock. Studio's client-side task
     // timeout is generous but not infinite, so shaving 200-400ms here is
     // worth the flat map.
-    const parsed = definitions.map((definition, index) => {
-      const slot = run.agents[index];
-      const started = Date.now();
-      try {
-        this.store.clearAgentFacts(definition.agent);
-        const result = definition.run(target);
-        this.store.addFacts(result.facts);
-        slot.summary = result.summary;
-        slot.factCount = result.facts.length;
-        return { index, definition, parseMs: Date.now() - started, ...result, error: null as string | null };
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        slot.status = 'failed';
-        slot.error = message;
-        ctx.logger.error(`Parser failed: ${definition.agent}`, { error: message });
-        return {
-          index,
-          definition,
-          parseMs: Date.now() - started,
-          facts: [],
-          summary: '',
-          evidence: null,
-          error: message,
-        };
-      }
-    });
+    const parsed = await Promise.all(
+      definitions.map(async (definition, index) => {
+        const slot = run.agents[index];
+        const started = Date.now();
+        try {
+          this.store.clearAgentFacts(definition.agent);
+          const result = await definition.run(target);
+          this.store.addFacts(result.facts);
+          slot.summary = result.summary;
+          slot.factCount = result.facts.length;
+          return { index, definition, parseMs: Date.now() - started, ...result, error: null as string | null };
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          slot.status = 'failed';
+          slot.error = message;
+          ctx.logger.error(`Parser failed: ${definition.agent}`, { error: message });
+          return {
+            index,
+            definition,
+            parseMs: Date.now() - started,
+            facts: [] as KnowledgeFact[],
+            summary: '',
+            evidence: null,
+            error: message,
+          };
+        }
+      })
+    );
     this.store.upsert('runs', run);
     ctx.task?.updateProgress(`Parsers done — ${parsed.filter((p) => !p.error).length}/${definitions.length} succeeded`);
 
@@ -415,12 +460,34 @@ export class SwarmTools {
 
     /* ------------------------- conflict cross-reference ------------------------- */
     let openConflicts = 0;
+    let conflictSources: { jira: string; chat: string } | undefined;
     if (input.detect_conflicts !== false) {
-      ctx.task?.updateProgress('Cross-referencing Jira against the Teams transcript');
+      ctx.task?.updateProgress('Cross-referencing Jira against the team chat record');
       try {
-        const detected = this.conflicts.detect(this.agile.loadSprint(), this.agile.loadTranscript());
-        run.conflictIds = detected.map((c) => c.id);
-        openConflicts = detected.filter((c) => c.status === 'open').length;
+        // Both were already fetched by their personas moments ago; re-reading
+        // is one more round trip but keeps this independent of persona
+        // ordering and of whether either persona failed.
+        const [sprint, transcript] = await Promise.all([
+          this.agile.loadSprint(),
+          this.agile.loadTranscript(),
+        ]);
+        conflictSources = { jira: sprint.dataSource, chat: transcript.dataSource };
+
+        // Cross-referencing two fixtures against a repository neither describes
+        // would pause the run on a contradiction that has nothing to do with
+        // the code being analysed.
+        const bothFictional =
+          sprint.dataSource === 'fixture' &&
+          transcript.dataSource === 'fixture' &&
+          !this.workspace.isBundledFixture(target);
+
+        if (bothFictional) {
+          ctx.logger.info('Conflict detection skipped — no live sources for this target');
+        } else {
+          const detected = this.conflicts.detect(sprint.value, transcript.value);
+          run.conflictIds = detected.map((c) => c.id);
+          openConflicts = detected.filter((c) => c.status === 'open').length;
+        }
       } catch (error) {
         ctx.logger.warn('Conflict detection skipped', {
           error: error instanceof Error ? error.message : String(error),
@@ -432,6 +499,8 @@ export class SwarmTools {
     let manifestPath: string | undefined;
     let manifestSkippedReason: string | undefined;
     let briefingSummary: string | undefined;
+    let manifestContent: string | undefined;
+    let manifestDestination: string | undefined;
 
     if (openConflicts > 0) {
       run.status = 'awaiting-resolution';
@@ -493,8 +562,10 @@ export class SwarmTools {
       if (input.synthesize !== false) {
         ctx.task?.updateProgress('Synthesizing CLAUDE.md');
         try {
-          const written = this.manifest.write(target);
-          manifestPath = this.workspace.rel(this.workspace.projectRoot, written.path);
+          const written = this.manifest.write(handle);
+          manifestPath = written.path;
+          manifestContent = written.content;
+          manifestDestination = written.destination;
           run.manifestPath = manifestPath;
           run.status = 'completed';
         } catch (error) {
@@ -522,15 +593,24 @@ export class SwarmTools {
       runId: run.id,
       status: run.status,
       target: run.target,
+      source: describeSource(handle),
       agentsCompleted: run.agents.filter((a) => a.status === 'done').length,
       agentsFailed: run.agents.filter((a) => a.status === 'failed').length,
       agents: run.agents,
       factsGathered: facts.length,
       factsByCategory: this.countBy(facts),
       openConflicts,
+      conflictSources,
+      integrations: this.agile.integrationStatus(),
       conflicts: this.store.all('conflicts'),
       generatedSkills: this.store.all('skills').length,
       manifestPath,
+      manifestDestination,
+      // For a remote target the clone is deleted the moment this tool returns,
+      // so the manifest body travels back in the response. An agent that asked
+      // the bridge to analyse a GitHub URL can write this straight into its own
+      // checkout without a second call.
+      manifestContent: handle.remote ? manifestContent : undefined,
       manifestSkippedReason,
       llm: {
         enabled: llmAvailable,
@@ -547,7 +627,10 @@ export class SwarmTools {
         openConflicts > 0
           ? 'Resolve the conflict(s), then the manifest will generate.'
           : manifestPath
-            ? `Manifest written to ${manifestPath}. Open it, or call query_knowledge to interrogate the graph.`
+            ? handle.remote
+              ? `Manifest generated for ${handle.label} and archived at ${manifestPath}. The clone has been ` +
+                `deleted — write \`manifestContent\` to CLAUDE.md at the root of your checkout.`
+              : `Manifest written to ${manifestPath}. Open it, or call query_knowledge to interrogate the graph.`
             : 'Call synthesize_claude_md to write the manifest.',
       buildStamp: SWARM_TOOL_BUILD,
     };
@@ -867,8 +950,23 @@ export class SwarmTools {
       {
         agent: 'product-synchronizer',
         title: 'Product Synchronizer — Jira sprint state',
-        run: () => {
-          const sprint = this.agile.loadSprint();
+        run: async (target) => {
+          const sourced = await this.agile.loadSprint();
+          const sprint = sourced.value;
+
+          // Fixture sprint data describes the bundled Aurora demo. Writing it
+          // into a manifest for somebody else's repository would tell their
+          // agent that six invented tickets are in flight — confidently, and
+          // completely wrongly. Contribute nothing instead, and say why.
+          const fictional = sourced.dataSource === 'fixture' && !this.workspace.isBundledFixture(target);
+          if (fictional) {
+            return {
+              facts: [],
+              summary: 'skipped — no live Jira configured, and the demo fixture does not describe this repository',
+              evidence: { skipped: true, hint: sourced.configurationHint },
+            };
+          }
+
           const inFlight = sprint.issues.filter((i) => !/done|closed/i.test(i.status));
           const facts: KnowledgeFact[] = [
             {
@@ -880,7 +978,7 @@ export class SwarmTools {
                 `Goal: ${sprint.sprint.goal ?? 'not stated'}. ` +
                 `Runs ${sprint.sprint.startDate ?? '?'} → ${sprint.sprint.endDate ?? '?'}. ` +
                 `${inFlight.length} of ${sprint.issues.length} issues still open.`,
-              evidence: [`${sprint.board} board`],
+              evidence: [`${sprint.board} board (${sourced.dataSource})`],
               weight: 5,
             },
             ...inFlight.map<KnowledgeFact>((issue) => ({
@@ -895,16 +993,30 @@ export class SwarmTools {
           ];
           return {
             facts,
-            summary: `sprint "${sprint.sprint.name}", ${inFlight.length} open issue(s)`,
+            summary:
+              `sprint "${sprint.sprint.name}", ${inFlight.length} open issue(s) · ${sourced.dataSource}`,
             evidence: sprint,
           };
         },
       },
       {
         agent: 'scrum-analyst',
-        title: 'Scrum Analyst — human consensus from Teams',
-        run: () => {
-          const transcript = this.agile.loadTranscript();
+        title: 'Scrum Analyst — human consensus from Slack',
+        run: async (target) => {
+          const sourced = await this.agile.loadTranscript();
+          const transcript = sourced.value;
+
+          // Same reasoning as the Product Synchronizer above: a fixture standup
+          // about Redis and a frozen ORM is authoritative for the demo repo and
+          // fiction everywhere else.
+          if (sourced.dataSource === 'fixture' && !this.workspace.isBundledFixture(target)) {
+            return {
+              facts: [],
+              summary: 'skipped — no live Slack configured, and the demo transcript does not describe this repository',
+              evidence: { skipped: true, hint: sourced.configurationHint },
+            };
+          }
+
           const binding = this.agile.bindingDirectives(transcript);
           const facts: KnowledgeFact[] = [
             {
@@ -930,7 +1042,7 @@ export class SwarmTools {
           ];
           return {
             facts,
-            summary: `${binding.length} binding directive(s) extracted`,
+            summary: `${binding.length} binding directive(s) extracted · ${sourced.dataSource}`,
             evidence: { transcript, binding },
           };
         },

@@ -21,8 +21,12 @@ export const TargetSchema = z.object({
     .string()
     .optional()
     .describe(
-      'Absolute path to the legacy codebase to analyse. Omit to use the bundled ' +
-        'Aurora Billing legacy fixture shipped with this server.'
+      'The codebase to analyse. Either a GitHub repository URL — ' +
+        'https://github.com/<owner>/<repo>, optionally /tree/<branch> — which is shallow-cloned ' +
+        'into a temp directory and deleted afterwards, or an absolute path to a directory on the ' +
+        'machine hosting this server. Prefer the URL form: it is the only one that works when ' +
+        'this server runs remotely, since it cannot read the calling machine\'s disk. ' +
+        'Omit to use the bundled Aurora Billing legacy fixture.'
     ),
 });
 

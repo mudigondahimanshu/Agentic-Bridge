@@ -14,6 +14,7 @@ import { Injectable } from '@nitrostack/core';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { RepoSourceService, type ClonedRepo } from './repo-source.service.js';
 
 export interface TraversalLimits {
   maxFiles: number;
@@ -60,7 +61,56 @@ export interface TraversalResult {
   bytesRead: number;
 }
 
-@Injectable()
+/**
+ * A resolved analysis target, whatever its origin.
+ *
+ * Tools receive one of these instead of a bare path so that a local directory
+ * and a freshly cloned GitHub repository are indistinguishable to everything
+ * downstream — the parsers, the personas and the manifest all just see `root`.
+ * The only asymmetry is `cleanup`, which the caller must invoke in a `finally`.
+ */
+export interface TargetHandle {
+  /** Absolute path to traverse. */
+  root: string;
+  /** What the user asked for: a URL for remote targets, else the resolved path. */
+  origin: string;
+  /** Human-facing label used in run records and the manifest header. */
+  label: string;
+  remote: boolean;
+  /** Present only for remote targets. */
+  repo?: ClonedRepo;
+  /** Idempotent. Deletes the clone for remote targets; a no-op for local ones. */
+  cleanup: () => Promise<void>;
+}
+
+/**
+ * The provenance block every target-accepting tool returns.
+ *
+ * Without this a response from a cloned repo is indistinguishable from one read
+ * off local disk, and an agent has no way to cite what it actually analysed.
+ * Temp paths are deliberately excluded — they are meaningless to the caller and
+ * gone by the time the response is read.
+ */
+export function describeSource(handle: TargetHandle): {
+  kind: 'local' | 'github';
+  origin: string;
+  repository?: string;
+  branch?: string;
+  commit?: string;
+} {
+  if (!handle.remote || !handle.repo) {
+    return { kind: 'local', origin: handle.label };
+  }
+  return {
+    kind: 'github',
+    origin: handle.origin,
+    repository: handle.repo.slug,
+    branch: handle.repo.branch,
+    commit: handle.repo.commit,
+  };
+}
+
+@Injectable({ deps: [RepoSourceService] })
 export class WorkspaceService {
   /** Directory of this NitroStack project (resolved from the compiled/ts entry). */
   readonly projectRoot: string;
@@ -74,8 +124,14 @@ export class WorkspaceService {
   readonly dataRoot: string;
 
   private readonly extraRoots: string[] = [];
+  /**
+   * Temp clones currently checked out. They are allow-listed only while a tool
+   * is using them, so a stale path cannot be replayed as a target after the
+   * directory has been released (and, on a reused inode, repopulated).
+   */
+  private readonly tempRoots = new Set<string>();
 
-  constructor() {
+  constructor(private repoSource: RepoSourceService) {
     this.projectRoot = WorkspaceService.locateProjectRoot();
     this.fixtureRoot = path.join(this.projectRoot, 'fixtures', 'legacy-monolith');
     this.dataRoot = path.join(this.projectRoot, 'data');
@@ -153,16 +209,89 @@ export class WorkspaceService {
     return process.cwd();
   }
 
+  /**
+   * Is this root the bundled Aurora demo fixture?
+   *
+   * Used to decide whether fixture-backed enterprise data is legitimate. For
+   * the bundled fixture the mock sprint and transcript ARE the truth of that
+   * repository; for anyone else's codebase they are fiction, and must not be
+   * written into their manifest.
+   */
+  isBundledFixture(root: string): boolean {
+    try {
+      return fs.realpathSync(root) === fs.realpathSync(this.fixtureRoot);
+    } catch {
+      return path.resolve(root) === path.resolve(this.fixtureRoot);
+    }
+  }
+
   /** Roots the swarm is permitted to read from. */
   get allowedRoots(): string[] {
-    return [this.projectRoot, this.fixtureRoot, ...this.extraRoots];
+    return [this.projectRoot, this.fixtureRoot, ...this.extraRoots, ...this.tempRoots];
   }
 
   /**
-   * Resolve a caller-supplied target into a real, allow-listed directory.
+   * Resolve any target — local path, bundled fixture, or GitHub URL — into a
+   * directory on this host, plus the cleanup that releases it.
+   *
+   * This is the single entry point every target-accepting tool should use.
+   * Remote targets are shallow-cloned into a temp directory that is allow-listed
+   * for exactly the lifetime of the handle; local targets take the existing
+   * synchronous path and get a no-op cleanup.
+   *
+   * Callers MUST release the handle in a `finally`:
+   *
+   *   const handle = await workspace.acquireTarget(input.target);
+   *   try { … } finally { await handle.cleanup(); }
+   */
+  async acquireTarget(target?: string): Promise<TargetHandle> {
+    if (!RepoSourceService.isRemote(target)) {
+      const root = this.resolveTarget(target);
+      return {
+        root,
+        origin: root,
+        label: this.rel(this.projectRoot, root) || root,
+        remote: false,
+        cleanup: async () => {},
+      };
+    }
+
+    const repo = await this.repoSource.clone(target!.trim());
+    // Real path first: on macOS os.tmpdir() is a symlink into /private, and the
+    // containment check below resolves symlinks, so registering the unresolved
+    // path would allow-list a directory that never matches.
+    const real = fs.realpathSync(repo.root);
+    this.tempRoots.add(real);
+
+    let released = false;
+    return {
+      root: real,
+      origin: target!.trim(),
+      label: `${repo.slug}${repo.branch ? `@${repo.branch}` : ''}`,
+      remote: true,
+      repo: { ...repo, root: real },
+      cleanup: async () => {
+        if (released) return;
+        released = true;
+        this.tempRoots.delete(real);
+        await this.repoSource.release(real);
+      },
+    };
+  }
+
+  /**
+   * Resolve a caller-supplied local target into a real, allow-listed directory.
    * Throws with an actionable message rather than silently falling back.
+   *
+   * Prefer `acquireTarget` in tools: this one rejects remote URLs by design.
    */
   resolveTarget(target?: string): string {
+    if (RepoSourceService.isRemote(target)) {
+      throw new Error(
+        `"${target}" is a repository URL, which this code path cannot resolve synchronously. ` +
+          `This is a bug — the calling tool should use acquireTarget().`
+      );
+    }
     if (!target || !target.trim()) {
       if (!fs.existsSync(this.fixtureRoot)) {
         throw new Error(

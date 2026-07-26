@@ -19,6 +19,7 @@ import {
   FixtureHealthCheck,
   KnowledgeHealthCheck,
   SecurityHealthCheck,
+  LiveDataHealthCheck,
 } from './health/system.health.js';
 
 /**
@@ -83,6 +84,12 @@ const transportType = resolveTransportType();
     SwarmModule,
     BridgeModule,
   ],
-  providers: [SystemHealthCheck, FixtureHealthCheck, KnowledgeHealthCheck, SecurityHealthCheck],
+  providers: [
+    SystemHealthCheck,
+    FixtureHealthCheck,
+    KnowledgeHealthCheck,
+    SecurityHealthCheck,
+    LiveDataHealthCheck,
+  ],
 })
 export class AppModule {}

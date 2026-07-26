@@ -32,6 +32,11 @@ written record against what humans actually said, **stops and asks a person when
 disagree**, and distils the result into a single `CLAUDE.md` manifest that any AI reads on
 startup.
 
+Point it at a **GitHub URL** and it clones, analyses and cleans up on its own — so the server
+runs in the cloud without ever needing the caller's hard drive. The sprint state comes from the
+**Jira** REST API and the spoken decisions from **Slack**, with the bundled fixtures as a
+clearly-labelled fallback when those are not configured.
+
 Along the way it writes new MCP tools for whatever it finds that has no modern equivalent.
 
 ```
@@ -46,8 +51,13 @@ run_swarm ──► 7 personas ──► knowledge base ──► conflict? ─�
 
 ```bash
 npm install     # also installs widget deps and builds them — see note below
-npm run verify
+npm run verify  # 71 assertions against the real server
+npm run doctor  # are my live integrations wired up, and if not, exactly what is missing?
 ```
+
+> Testing this against **your own codebase and a real Jira/Slack tenant**?
+> [`TESTING.md`](TESTING.md) is the phased guide — credentials, validation, expected output and
+> failure diagnosis.
 
 > **One command is enough.** A `postinstall` step installs the widget dependencies and
 > produces the static export. That export is derived, so it is correctly absent from git —
@@ -58,9 +68,9 @@ npm run verify
 > If either safety net is bypassed (`npm install --ignore-scripts`), run `npm run setup`.
 
 `npm run verify` spawns the real MCP server over STDIO and drives the entire demo path with
-live JSON-RPC — 89 assertions covering every claim in this README. It also boots a second
+live JSON-RPC — 71 assertions covering every claim in this README. It also boots a second
 server on the HTTP transport to prove the 50 MB body limit reached the Express parser and that
-an unauthenticated mutation is refused at the socket. If it prints `ALL 89 CHECKS PASSED`, the
+an unauthenticated mutation is refused at the socket. If it prints `ALL 71 CHECKS PASSED`, the
 demo works.
 
 ### In NitroStudio
@@ -86,7 +96,7 @@ See [`DEMO.md`](DEMO.md) for the timed stage script.
 | `documentation` | Documentation Synthesizer | `parse_package_specs` |
 | `qa` | Quality Assurance Analyst | `extract_test_strategy` |
 | `devops` | DevOps Navigator | `parse_ci_cd_pipelines` |
-| `agile` | Product Synchronizer / Scrum Analyst | `fetch_sprint_goals`, `fetch_meeting_transcripts` |
+| `agile` | Product Synchronizer / Scrum Analyst | `fetch_sprint_goals` (live Jira), `fetch_meeting_transcripts` (live Slack) |
 | `uiux` | UI/UX Integrator | `parse_design_system` |
 | `conflict` | — | `detect_conflicts`, `resolve_conflict`, `list_conflicts` |
 | `skills` | — | `generate_custom_skill`, `list_generated_skills` |
@@ -170,9 +180,19 @@ top; the manifest is correct without it.
 
 These are things a reviewer would find, so they are stated up front.
 
-- **Jira and Teams are local fixtures**, not live OAuth — `data/mock-jira-sprint.json` and
-  `data/mock-teams-transcript.txt`. The *shape* is the real integration shape: swap
-  `AgileService.loadSprint()` for a Jira REST call and nothing downstream changes.
+- **Jira and Slack are live, with the fixtures as a fallback.** `fetch_sprint_goals` calls the
+  Jira Agile REST API and `fetch_meeting_transcripts` reads a Slack channel, both with simple
+  token auth. When the credentials are absent the tools return the bundled fixtures
+  (`data/mock-jira-sprint.json`, `data/mock-teams-transcript.txt`) and say so — every response
+  carries `dataSource: "jira-live" | "slack-live" | "fixture"` plus a `configurationHint`
+  naming the variables to set. Mock data is never presented as real. `BRIDGE_DATA_MODE=live`
+  turns the fallback off entirely if you would rather fail loudly.
+- **Slack, not Teams, for the spoken record.** Teams means Graph, which means an app
+  registration, admin consent and a transcript permission before a single message arrives. For
+  reading a channel, that ceremony buys nothing. The transcript *parser* is unchanged: Slack is
+  rendered into the same `[HH:MM] Speaker: text` layout, so utterance segmentation, entity
+  extraction, adopt/reject/freeze/mandate classification and the conflict engine are all reused
+  verbatim. Adding another chat source is a rendering problem, not a rewrite.
 - **Side-effecting pipeline stages are real, but gated twice.** `run_tests`, `push`, `deploy`,
   `update_jira` and `send_slack_message` genuinely run the test command, commit and push,
   dispatch a GitHub Actions workflow or Jenkins job, call Jira REST v3 and post to a Slack
@@ -239,7 +259,14 @@ Everything has a working default. Nothing is required.
 | `BRIDGE_JWT_SECRET` | unset | Enables HS256/384/512 bearer tokens (`BRIDGE_JWT_ISSUER` / `_AUDIENCE` optional) |
 | `BRIDGE_AUTH_SCOPE` | `mutations` | `all` requires a credential for reads too |
 | `BRIDGE_JSON_BODY_LIMIT` | `50mb` | Max JSON request body on the HTTP transport |
-| `BRIDGE_ALLOWED_ROOTS` | project + fixture | `:`-separated extra roots the swarm may read |
+| `BRIDGE_ALLOWED_ROOTS` | project + fixture | `:`-separated extra local roots the swarm may read |
+| `BRIDGE_ALLOWED_REPO_HOSTS` | `github.com` | Git hosts a `target` URL may point at |
+| `BRIDGE_CLONE_TIMEOUT_MS` | `120000` | Abort a clone that outruns this |
+| `GITHUB_TOKEN` | unset | Clone private repositories (also used by the deploy stage) |
+| `BRIDGE_DATA_MODE` | `auto` | `live` = no fixture fallback; `fixture` = never call out |
+| `JIRA_BASE_URL` / `JIRA_EMAIL` / `JIRA_API_TOKEN` | unset | Live sprint state (`JIRA_BOARD_ID` optional) |
+| `SLACK_BOT_TOKEN` / `SLACK_CHANNEL_ID` | unset | Live team decisions (`SLACK_MESSAGE_LIMIT` optional) |
+| `BRIDGE_AUTHORITY_LEADS` / `_OPS` | unset | Whose spoken decision outranks a ticket |
 | `BRIDGE_ALLOW_SKILL_GENERATION` | `true` | Set `false` to disable runtime skill minting |
 | `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
 | `ANTHROPIC_API_KEY` | unset | Optional; enables narrative enrichment |
@@ -273,15 +300,66 @@ Enforcement happens at two points against one list: an Express edge in front of 
 the verified credential into the call's `_meta`, so a request that passed the socket also passes
 the guard.
 
-### Pointing at your own codebase
+### Using it from Claude Code (or any MCP client)
 
-Every reconnaissance tool takes an optional `target`:
+Register the bundled launcher from inside the project you want analysed:
+
+```bash
+cd ~/work/my-legacy-app
+
+claude mcp add agentic-bridge \
+  -e BRIDGE_ALLOWED_ROOTS="$PWD" \
+  -- /abs/path/to/Agentic-Bridge/bin/agentic-bridge
+
+claude mcp list        # → agentic-bridge: ✔ Connected
+```
+
+Then, in the session:
 
 ```
+> Use agentic-bridge to run the swarm on this project and write the manifest.
+> Use agentic-bridge to run the swarm on https://github.com/some-org/some-repo
+```
+
+The first writes `CLAUDE.md` into your repo root, so the *next* session in that folder starts
+already knowing its architecture, dependencies and test strategy. The second analyses a repo you
+have never cloned and hands the manifest back inline.
+
+Use `bin/agentic-bridge` rather than registering `npx tsx src/index.ts` directly. An MCP client
+spawns the server with the client's working directory, and both tsx's `tsconfig.json` lookup and
+NitroStack's `@Widget` bundle resolution are cwd-relative — a raw command fails at boot. The
+launcher `cd`s into the project first, then execs.
+
+### Pointing at your own codebase
+
+Every reconnaissance tool takes an optional `target`, which may be a **GitHub URL** or a local
+absolute path:
+
+```
+run_swarm             { "target": "https://github.com/your-org/legacy-monolith" }
+map_file_dependencies { "target": "https://github.com/your-org/legacy-monolith/tree/release-3" }
 map_file_dependencies { "target": "/absolute/path/to/your/repo" }
 ```
 
-Paths outside the allow-list are refused with an actionable message. Opt in with:
+The URL form is the one that matters for a hosted bridge. A server running in NitroCloud cannot
+read the calling machine's disk, so a local path is meaningless there. Given a URL the bridge:
+
+1. creates a private temp directory (`fs.mkdtemp`, mode 0700),
+2. `git clone --depth 1 --single-branch --no-tags` into it,
+3. runs the ordinary traversal over that directory,
+4. deletes it in a `finally` — on the success path, the failure path and on process exit.
+
+Because the clone is gone by the time the call returns, a remote run cannot write `CLAUDE.md`
+into the repository it analysed. It archives the manifest under `.bridge/manifests/` **and
+returns the full text as `manifestContent`**, so an agent can write it straight into its own
+checkout. A local target gets `CLAUDE.md` written beside the code, as you would expect.
+
+Only `github.com` is clonable by default; widen deliberately with
+`BRIDGE_ALLOWED_REPO_HOSTS`. URLs carrying embedded credentials are refused — use `GITHUB_TOKEN`
+for private repositories, which is passed to git through the environment rather than argv or the
+URL, so it does not show up in `ps`.
+
+Local paths outside the allow-list are refused with an actionable message. Opt in with:
 
 ```bash
 export BRIDGE_ALLOWED_ROOTS="/Users/you/work/big-monolith"
@@ -330,8 +408,8 @@ src/
 ├── health/                     4 health checks, including security posture
 └── skills/                     generated at runtime
 fixtures/legacy-monolith/       34-file synthetic enterprise repo with a planted contradiction
-data/                           mock Jira sprint + Teams transcript
-scripts/verify.ts               89-assertion end-to-end suite
+data/                           fallback Jira sprint + chat transcript (used when live creds are absent)
+scripts/verify.ts               71-assertion end-to-end suite
 ```
 
 Built with `@nitrostack/core` 1.0.14 · `@nitrostack/cli` 1.0.15 · `@nitrostack/widgets` 1.0.8

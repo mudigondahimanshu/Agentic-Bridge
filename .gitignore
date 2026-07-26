@@ -60,7 +60,12 @@ tokens.json
 .bridge/
 src/skills/*.skill.ts
 
-# NOTE: CLAUDE.md is deliberately NOT ignored. It is the artifact this project
-# exists to produce, and reviewers should be able to read it in the repo. Its
-# header states which codebase it describes (the bundled fixture, not this one).
+# NOTE: the root CLAUDE.md is deliberately NOT ignored. It is the artifact this
+# project exists to produce, and reviewers should be able to read it in the repo.
+# Its header states which codebase it describes (the bundled fixture, not this one).
+#
+# The manifest is now written beside the code it describes, so a run against the
+# bundled fixture drops one inside fixtures/. That copy is regenerated output,
+# not a source file.
+fixtures/legacy-monolith/CLAUDE.md
 .nitrostudio/

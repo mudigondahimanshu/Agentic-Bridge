@@ -3,7 +3,7 @@
  */
 import { Injectable, ToolDecorator as Tool, Widget, ExecutionContext, z } from '@nitrostack/core';
 import { CodebaseService } from './codebase.service.js';
-import { WorkspaceService } from '../../shared/services/workspace.service.js';
+import { WorkspaceService, describeSource } from '../../shared/services/workspace.service.js';
 import { StoreService } from '../../shared/services/store.service.js';
 import { TargetSchema } from '../../shared/schemas/index.js';
 import type { KnowledgeFact } from '../../shared/schemas/index.js';
@@ -45,60 +45,74 @@ export class CodebaseTools {
     input: { target?: string; include_nodes?: boolean },
     ctx: ExecutionContext
   ) {
-    const target = this.workspace.resolveTarget(input.target);
-    ctx.logger.info('Structural Cartographer traversing', { target });
-
-    const map = this.codebase.buildMap(target);
-
-    const facts: KnowledgeFact[] = [
-      {
-        id: 'arch:topography',
-        agent: 'structural-cartographer',
-        category: 'architecture',
-        title: 'Architectural topography',
-        detail: this.describeLayers(map.layers),
-        evidence: Object.keys(map.layers),
-        weight: 5,
-      },
-      {
-        id: 'arch:tree',
-        agent: 'structural-cartographer',
-        category: 'architecture',
-        title: 'Directory tree',
-        detail: map.tree,
-        evidence: [],
-        weight: 4,
-      },
-      ...map.hotspots.slice(0, 5).map<KnowledgeFact>((h) => ({
-        id: `arch:hotspot:${h.path}`,
-        agent: 'structural-cartographer',
-        category: 'architecture',
-        title: `High-blast-radius file: ${h.path}`,
-        detail:
-          `${h.path} (${h.layer}) is imported by ${h.inbound} other file(s). ` +
-          `Changing it requires reviewing every dependent.`,
-        evidence: [h.path],
-        weight: 4,
-      })),
-    ];
-
-    if (map.cycles.length) {
-      facts.push({
-        id: 'arch:cycles',
-        agent: 'structural-cartographer',
-        category: 'architecture',
-        title: 'Import cycles',
-        detail: map.cycles.map((c) => c.join(' → ')).join('\n'),
-        evidence: map.cycles.flat(),
-        weight: 3,
+    // Remote targets are cloned here and deleted in the `finally`. Everything
+    // between the two is identical to the local-path case.
+    const handle = await this.workspace.acquireTarget(input.target);
+    try {
+      ctx.logger.info('Structural Cartographer traversing', {
+        target: handle.label,
+        remote: handle.remote,
       });
+
+      const map = this.codebase.buildMap(handle.root);
+
+      const facts: KnowledgeFact[] = [
+        {
+          id: 'arch:topography',
+          agent: 'structural-cartographer',
+          category: 'architecture',
+          title: 'Architectural topography',
+          detail: this.describeLayers(map.layers),
+          evidence: Object.keys(map.layers),
+          weight: 5,
+        },
+        {
+          id: 'arch:tree',
+          agent: 'structural-cartographer',
+          category: 'architecture',
+          title: 'Directory tree',
+          detail: map.tree,
+          evidence: [],
+          weight: 4,
+        },
+        ...map.hotspots.slice(0, 5).map<KnowledgeFact>((h) => ({
+          id: `arch:hotspot:${h.path}`,
+          agent: 'structural-cartographer',
+          category: 'architecture',
+          title: `High-blast-radius file: ${h.path}`,
+          detail:
+            `${h.path} (${h.layer}) is imported by ${h.inbound} other file(s). ` +
+            `Changing it requires reviewing every dependent.`,
+          evidence: [h.path],
+          weight: 4,
+        })),
+      ];
+
+      if (map.cycles.length) {
+        facts.push({
+          id: 'arch:cycles',
+          agent: 'structural-cartographer',
+          category: 'architecture',
+          title: 'Import cycles',
+          detail: map.cycles.map((c) => c.join(' → ')).join('\n'),
+          evidence: map.cycles.flat(),
+          weight: 3,
+        });
+      }
+
+      this.store.clearAgentFacts('structural-cartographer');
+      this.store.addFacts(facts);
+
+      const { nodes, ...summary } = map;
+      // Report the target the caller recognises — the repo slug, not the temp
+      // directory it happens to be sitting in for the next few milliseconds.
+      const described = { ...summary, target: handle.label, source: describeSource(handle) };
+      return input.include_nodes
+        ? { ...described, nodes }
+        : { ...described, nodeCount: nodes.length };
+    } finally {
+      await handle.cleanup();
     }
-
-    this.store.clearAgentFacts('structural-cartographer');
-    this.store.addFacts(facts);
-
-    const { nodes, ...summary } = map;
-    return input.include_nodes ? { ...summary, nodes } : { ...summary, nodeCount: nodes.length };
   }
 
   @Tool({
@@ -127,29 +141,37 @@ export class CodebaseTools {
     input: { target?: string; query: string; max_depth?: number },
     ctx: ExecutionContext
   ) {
-    const target = this.workspace.resolveTarget(input.target);
-    const map = this.codebase.buildMap(target);
-    const result = this.codebase.changeSurface(map, input.query, input.max_depth ?? 3);
+    const handle = await this.workspace.acquireTarget(input.target);
+    try {
+      const map = this.codebase.buildMap(handle.root);
+      const result = this.codebase.changeSurface(map, input.query, input.max_depth ?? 3);
 
-    ctx.logger.info('Change surface computed', {
-      query: input.query,
-      seeds: result.seeds.length,
-      impacted: result.impacted.length,
-    });
+      ctx.logger.info('Change surface computed', {
+        query: input.query,
+        seeds: result.seeds.length,
+        impacted: result.impacted.length,
+      });
 
-    if (!result.seeds.length) {
+      const source = describeSource(handle);
+
+      if (!result.seeds.length) {
+        return {
+          ...result,
+          source,
+          note: `Nothing matched "${input.query}". Try a filename fragment such as "orm", "cache" or "invoice".`,
+        };
+      }
+
       return {
         ...result,
-        note: `Nothing matched "${input.query}". Try a filename fragment such as "orm", "cache" or "invoice".`,
+        source,
+        summary:
+          `Changing ${result.seeds.length} seed file(s) impacts ${result.impacted.length} ` +
+          `dependent file(s) within ${input.max_depth ?? 3} hops.`,
       };
+    } finally {
+      await handle.cleanup();
     }
-
-    return {
-      ...result,
-      summary:
-        `Changing ${result.seeds.length} seed file(s) impacts ${result.impacted.length} ` +
-        `dependent file(s) within ${input.max_depth ?? 3} hops.`,
-    };
   }
 
   private describeLayers(layers: Record<string, number>): string {

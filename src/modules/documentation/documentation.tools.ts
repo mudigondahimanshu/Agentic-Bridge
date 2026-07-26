@@ -1,6 +1,10 @@
 import { Injectable, ToolDecorator as Tool, ExecutionContext } from '@nitrostack/core';
 import { DocumentationService } from './documentation.service.js';
-import { WorkspaceService } from '../../shared/services/workspace.service.js';
+import {
+  WorkspaceService,
+  describeSource,
+  type TargetHandle,
+} from '../../shared/services/workspace.service.js';
 import { StoreService } from '../../shared/services/store.service.js';
 import { TargetSchema } from '../../shared/schemas/index.js';
 import type { KnowledgeFact } from '../../shared/schemas/index.js';
@@ -32,7 +36,18 @@ export class DocumentationTools {
     },
   })
   async parsePackageSpecs(input: { target?: string }, ctx: ExecutionContext) {
-    const target = this.workspace.resolveTarget(input.target);
+    // A GitHub URL is cloned by acquireTarget and released in the finally; the
+    // analysis body below is unaware of the difference.
+    const handle = await this.workspace.acquireTarget(input.target);
+    try {
+      return this.synthesize(handle, ctx);
+    } finally {
+      await handle.cleanup();
+    }
+  }
+
+  private synthesize(handle: TargetHandle, ctx: ExecutionContext) {
+    const target = handle.root;
     const report = this.docs.analyse(target);
     ctx.logger.info('Documentation Synthesizer complete', {
       manifests: report.manifests.length,
@@ -77,6 +92,7 @@ export class DocumentationTools {
     // Runtime deps are the load-bearing ones; trim dev noise from the payload.
     return {
       ...report,
+      source: describeSource(handle),
       dependencies: report.dependencies.filter((d) => d.scope !== 'dev').slice(0, 80),
       devDependencyCount: report.dependencies.filter((d) => d.scope === 'dev').length,
     };

@@ -3,7 +3,11 @@ import { AdminGuard } from '../../shared/security/admin.guard.js';
 import { PipelineService, NODE_CATALOG } from './pipeline.service.js';
 import { EffectsService } from './effects.service.js';
 import { StoreService } from '../../shared/services/store.service.js';
-import { WorkspaceService } from '../../shared/services/workspace.service.js';
+import {
+  WorkspaceService,
+  describeSource,
+  type TargetHandle,
+} from '../../shared/services/workspace.service.js';
 import { PipelineGraphSchema, PIPELINE_NODE_TYPES } from '../../shared/schemas/index.js';
 import type { PipelineGraph } from '../../shared/schemas/index.js';
 
@@ -160,10 +164,35 @@ export class PipelineTools {
     }
 
     const executeSideEffects = input.execute_side_effects === true;
-    // Resolved through the workspace allow-list even in plan mode, so a bad
+    // Acquired through the workspace allow-list even in plan mode, so a bad
     // target fails immediately rather than at the first stage that touches disk.
-    const target = this.workspace.resolveTarget(input.target);
+    const handle = await this.workspace.acquireTarget(input.target);
+    try {
+      // A shallow clone in a temp directory is the wrong place to commit, push
+      // or deploy from: the working tree disappears the moment this call
+      // returns, so a "successful" push would be unreviewable and a failed one
+      // would be inexplicable. Analysis stages are fine; mutations are not.
+      if (executeSideEffects && handle.remote) {
+        throw new Error(
+          `Refusing to execute side effects against ${handle.label}: it is a temporary shallow ` +
+            `clone that is deleted when this call returns. Run the pipeline in plan mode against ` +
+            `the URL, or pass a local checkout as \`target\` to execute for real.`
+        );
+      }
+      return await this.executePipeline(input, ctx, pipeline, handle, executeSideEffects);
+    } finally {
+      await handle.cleanup();
+    }
+  }
 
+  private async executePipeline(
+    input: { task: string; execute_side_effects?: boolean },
+    ctx: ExecutionContext,
+    pipeline: PipelineGraph,
+    handle: TargetHandle,
+    executeSideEffects: boolean
+  ) {
+    const target = handle.root;
     const order = this.pipeline.validateAndOrder(pipeline);
     const byId = new Map(pipeline.nodes.map((n) => [n.id, n]));
     const results = [];
@@ -204,7 +233,8 @@ export class PipelineTools {
     return {
       pipeline: pipeline.name,
       task: input.task,
-      target: this.workspace.rel(this.workspace.projectRoot, target) || target,
+      target: handle.label,
+      source: describeSource(handle),
       stageCount: order.length,
       completed: results.length,
       executed: results.filter((r) => r.executed).length,

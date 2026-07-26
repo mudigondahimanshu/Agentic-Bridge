@@ -1,6 +1,10 @@
 import { Injectable, ToolDecorator as Tool, Widget, ExecutionContext } from '@nitrostack/core';
 import { UiUxService } from './uiux.service.js';
-import { WorkspaceService } from '../../shared/services/workspace.service.js';
+import {
+  WorkspaceService,
+  describeSource,
+  type TargetHandle,
+} from '../../shared/services/workspace.service.js';
 import { StoreService } from '../../shared/services/store.service.js';
 import { TargetSchema } from '../../shared/schemas/index.js';
 import type { KnowledgeFact } from '../../shared/schemas/index.js';
@@ -54,7 +58,17 @@ export class UiUxTools {
   })
   @Widget('design-system')
   async parseDesignSystem(input: { target?: string }, ctx: ExecutionContext) {
-    const target = this.workspace.resolveTarget(input.target);
+    // Remote targets are cloned by acquireTarget and deleted in the finally.
+    const handle = await this.workspace.acquireTarget(input.target);
+    try {
+      return this.designSystem(handle, ctx);
+    } finally {
+      await handle.cleanup();
+    }
+  }
+
+  private designSystem(handle: TargetHandle, ctx: ExecutionContext) {
+    const target = handle.root;
     const report = this.uiux.analyse(target);
     ctx.logger.info('UI/UX Integrator complete', {
       tokens: report.tokens.length,
@@ -133,6 +147,6 @@ export class UiUxTools {
     this.store.clearAgentFacts('uiux-integrator');
     this.store.addFacts(facts);
 
-    return report;
+    return { ...report, source: describeSource(handle) };
   }
 }

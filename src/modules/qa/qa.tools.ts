@@ -1,6 +1,10 @@
 import { Injectable, ToolDecorator as Tool, ExecutionContext } from '@nitrostack/core';
 import { QaService } from './qa.service.js';
-import { WorkspaceService } from '../../shared/services/workspace.service.js';
+import {
+  WorkspaceService,
+  describeSource,
+  type TargetHandle,
+} from '../../shared/services/workspace.service.js';
 import { StoreService } from '../../shared/services/store.service.js';
 import { TargetSchema } from '../../shared/schemas/index.js';
 import type { KnowledgeFact } from '../../shared/schemas/index.js';
@@ -32,7 +36,17 @@ export class QaTools {
     },
   })
   async extractTestStrategy(input: { target?: string }, ctx: ExecutionContext) {
-    const target = this.workspace.resolveTarget(input.target);
+    // Remote targets are cloned by acquireTarget and deleted in the finally.
+    const handle = await this.workspace.acquireTarget(input.target);
+    try {
+      return this.strategy(handle, ctx);
+    } finally {
+      await handle.cleanup();
+    }
+  }
+
+  private strategy(handle: TargetHandle, ctx: ExecutionContext) {
+    const target = handle.root;
     const report = this.qa.analyse(target);
     ctx.logger.info('QA Analyst complete', { frameworks: report.frameworks.length });
 
@@ -119,6 +133,6 @@ export class QaTools {
     this.store.clearAgentFacts('qa-analyst');
     this.store.addFacts(facts);
 
-    return report;
+    return { ...report, source: describeSource(handle) };
   }
 }

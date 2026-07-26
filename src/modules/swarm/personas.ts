@@ -222,7 +222,7 @@ may already be stale.
 
   'scrum-analyst': brief(
     'scrum-analyst',
-    'Scrum Analyst — human consensus from Teams',
+    'Scrum Analyst — human consensus from team chat',
     `
 You are the Scrum Analyst. Your domain is what the team decided out loud and
 never wrote down.

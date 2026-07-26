@@ -332,7 +332,11 @@ async function main() {
   // Start from a clean slate so the run is reproducible.
   const stateDir = path.join(ROOT, '.bridge');
   if (fs.existsSync(stateDir)) fs.rmSync(stateDir, { recursive: true, force: true });
-  const manifestPath = path.join(ROOT, 'CLAUDE.md');
+  // The manifest is written beside the code it describes, so an unqualified
+  // run lands it in the bundled fixture rather than in this project's root.
+  const manifestPath = path.join(ROOT, 'fixtures', 'legacy-monolith', 'CLAUDE.md');
+  // Note: this project's own CLAUDE.md is a checked-in artifact and is
+  // deliberately NOT touched here — the bridge no longer writes to it.
   if (fs.existsSync(manifestPath)) fs.rmSync(manifestPath);
   const skillsDir = path.join(ROOT, 'src', 'skills');
   if (fs.existsSync(skillsDir)) fs.rmSync(skillsDir, { recursive: true, force: true });
@@ -377,6 +381,80 @@ async function main() {
     check('prompts registered', prompts >= 3, `${prompts} prompts`);
 
     /* ------------------------ individual reconnaissance ------------------------ */
+    /* --------------------- live data sources + remote repos --------------------- */
+    // The two things that make this server deployable rather than demo-only:
+    // it reads real enterprise systems, and it analyses a repo it does not have
+    // on local disk. Both are checked before the fixture-backed sections so a
+    // failure here is unambiguous.
+    console.log('\n\x1b[1m2b. Live data sources\x1b[0m');
+
+    const sprintProbe = await client.callTool('fetch_sprint_goals');
+    const jiraConfigured = !!(process.env.JIRA_BASE_URL || process.env.JIRA_DOMAIN);
+    check(
+      'sprint state reports its provenance',
+      sprintProbe.dataSource === 'jira-live' || sprintProbe.dataSource === 'fixture',
+      String(sprintProbe.dataSource)
+    );
+    check(
+      jiraConfigured
+        ? 'live Jira credentials produce live sprint data'
+        : 'unconfigured Jira falls back to the fixture and says how to fix it',
+      jiraConfigured
+        ? sprintProbe.dataSource === 'jira-live'
+        : sprintProbe.dataSource === 'fixture' && /JIRA_/.test(String(sprintProbe.configurationHint)),
+      jiraConfigured ? undefined : String(sprintProbe.configurationHint).slice(0, 70)
+    );
+
+    const chatProbe = await client.callTool('fetch_meeting_transcripts');
+    const slackConfigured = !!process.env.SLACK_BOT_TOKEN;
+    check(
+      slackConfigured
+        ? 'live Slack credentials produce live decisions'
+        : 'unconfigured Slack falls back to the fixture and says how to fix it',
+      slackConfigured
+        ? chatProbe.dataSource === 'slack-live'
+        : chatProbe.dataSource === 'fixture' && /SLACK_/.test(String(chatProbe.configurationHint)),
+      slackConfigured ? undefined : String(chatProbe.configurationHint).slice(0, 70)
+    );
+    check(
+      'decision classification survives the source swap',
+      (chatProbe.bindingDirectives as unknown[])?.length > 0,
+      `${(chatProbe.bindingDirectives as unknown[])?.length ?? 0} binding directive(s)`
+    );
+
+    console.log('\n\x1b[1m2c. Remote codebase ingestion\x1b[0m');
+
+    const badHost = await client.callTool('map_file_dependencies', {
+      target: 'https://gitlab.com/some/repo',
+    }).catch((e: Error) => ({ error: e.message }));
+    check(
+      'a non-allow-listed git host is refused',
+      /allow-list/i.test(JSON.stringify(badHost)),
+      'host allow-list held'
+    );
+
+    if (process.env.BRIDGE_SKIP_NETWORK_CHECKS === 'true') {
+      console.log('  \x1b[2m· remote clone check skipped (BRIDGE_SKIP_NETWORK_CHECKS=true)\x1b[0m');
+    } else {
+      try {
+        const remote = await client.callTool('map_file_dependencies', {
+          target: 'https://github.com/octocat/Hello-World',
+        });
+        check(
+          'a GitHub URL is cloned and traversed',
+          (remote.source as { kind?: string })?.kind === 'github',
+          `${(remote.source as { repository?: string })?.repository}@${(remote.source as { commit?: string })?.commit?.slice(0, 8)}`
+        );
+        check(
+          'the temp clone is reported by repo slug, not by temp path',
+          !/tmp/i.test(String(remote.target)),
+          String(remote.target)
+        );
+      } catch (error) {
+        check('a GitHub URL is cloned and traversed', false, (error as Error).message.slice(0, 90));
+      }
+    }
+
     console.log('\n\x1b[1m3. Reconnaissance tools (bundled legacy fixture)\x1b[0m');
 
     const map = await client.callTool('map_file_dependencies');
@@ -645,6 +723,11 @@ return { callSites: hits.length, tables, files: [...new Set(hits.map(h => h.path
     const manifest = await client.callTool('synthesize_claude_md');
     check('manifest written', manifest.written === true, `${manifest.lines} lines, ${manifest.bytes} bytes`);
     check('human ruling recorded in the manifest', manifest.resolvedConflicts === 1);
+    check(
+      'manifest landed in the analysed repo, not the bridge',
+      manifest.destination === 'analyzed-repo' && fs.existsSync(manifestPath),
+      String(manifest.absolutePath)
+    );
 
     const content = fs.readFileSync(manifestPath, 'utf8');
     const sections: [string, string][] = [

@@ -14,7 +14,8 @@
     "widget": "npm --prefix src/widgets",
     "setup": "npm --prefix src/widgets install --no-audit --no-fund && npm run build",
     "typecheck": "tsc --noEmit",
-    "verify": "tsx scripts/verify.ts"
+    "verify": "tsx scripts/verify.ts",
+    "doctor": "tsx scripts/doctor.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.115.0",
